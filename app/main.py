@@ -33,22 +33,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# ═══ Handle OPTIONS preflight for all routes ═══
-# Return proper CORS headers so the browser accepts custom headers
-# (e.g. Authorization: Bearer) on the actual request.
-@app.options("/{path:path}")
-async def options_handler(path: str):
-    origin = _ALLOWED_ORIGINS[0] if _ALLOWED_ORIGINS else "*"
-    return JSONResponse(
-        content={"ok": True},
-        headers={
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
-
 app.include_router(extract_router, prefix="/api", tags=["Extraction"])
 app.include_router(email_router, prefix="/api/email", tags=["Email"])
 app.include_router(access_router, prefix="/api/access", tags=["Access"])
