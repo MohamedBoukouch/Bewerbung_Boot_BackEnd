@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: bewerbung-boot-backend
+    runtime: python
+    pythonVersion: "3.9"
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: APPS_SCRIPT_API_KEY
+        sync: false
+      - key: APPS_SCRIPT_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://bewerbung-boot-backend.onrender.com/api/access/google/callback
+      - key: FRONTEND_CALLBACK_URL
+        value: http://localhost:5173/auth/callback
+      - key: SESSION_SECRET_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: http://localhost:5173,https://bewerbung-boot-backend.onrender.com
+      - key: PORT
+        sync: false

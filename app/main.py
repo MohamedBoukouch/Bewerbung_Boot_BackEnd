@@ -1,3 +1,4 @@
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -14,9 +15,18 @@ app = FastAPI(
 )
 
 # ═══ CORS — MUST be before routers ═══
+# Origins are configurable so the same build works locally and on Render.
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:3000",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,10 +38,11 @@ app.add_middleware(
 # (e.g. Authorization: Bearer) on the actual request.
 @app.options("/{path:path}")
 async def options_handler(path: str):
+    origin = _ALLOWED_ORIGINS[0] if _ALLOWED_ORIGINS else "*"
     return JSONResponse(
         content={"ok": True},
         headers={
-            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "*",
