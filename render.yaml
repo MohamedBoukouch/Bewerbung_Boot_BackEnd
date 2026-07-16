@@ -2,7 +2,7 @@ services:
   - type: web
     name: bewerbung-boot-backend
     runtime: python
-    pythonVersion: "3.9"
+    pythonVersion: "3.12"
     plan: free
     region: frankfurt
     branch: main
