@@ -21,6 +21,7 @@ _ALLOWED_ORIGINS = [
     for o in os.environ.get(
         "CORS_ORIGINS",
         "http://localhost:5173,http://localhost:3000",
+        "https://bewerbung-boot-front-end.vercel.app"
     ).split(",")
     if o.strip()
 ]
