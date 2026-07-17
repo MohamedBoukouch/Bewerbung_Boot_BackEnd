@@ -1,10 +1,10 @@
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app.routes import extract_router, email_router, access_router
 
@@ -14,17 +14,18 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# ═══ CORS — MUST be before routers ═══
-# Origins are configurable so the same build works locally and on Render.
+# Allowed origins
 _ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get(
         "CORS_ORIGINS",
-        "http://localhost:5173,http://localhost:3000",
-        "https://bewerbung-boot-front-end.vercel.app"
+        "http://localhost:5173,"
+        "http://localhost:3000,"
+        "https://bewerbung-boot-front-end.vercel.app",
     ).split(",")
     if o.strip()
 ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
@@ -41,4 +42,7 @@ app.include_router(access_router, prefix="/api/access", tags=["Access"])
 
 @app.get("/")
 async def root():
-    return {"message": "Bewerbung Boot API is running!", "version": "2.0.0"}
+    return {
+        "message": "Bewerbung Boot API is running!",
+        "version": "2.0.0",
+    }
