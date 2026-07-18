@@ -6,7 +6,6 @@ then find emails via company websites.
 """
 import asyncio
 import re
-import time
 from typing import List, Optional, Callable
 
 from bs4 import BeautifulSoup
@@ -271,55 +270,21 @@ class AzubicaScraper(BaseScraper):
     ):
         super().__init__(profession, location, max_results, field_tags, log_callback)
 
-    def _create_driver(self):
-        """Create headless Chrome driver."""
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
+    def _headers(self):
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        }
 
+    async def _fetch(self, client: httpx.AsyncClient, url: str) -> str:
         try:
-            driver = webdriver.Chrome(options=options)
-            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            return driver
+            resp = await client.get(url, headers=self._headers(), timeout=15.0, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.text
         except Exception as e:
-            self.log("error", f"Failed to create Chrome driver: {e}")
-            try:
-                from webdriver_manager.chrome import ChromeDriverManager
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=options)
-                return driver
-            except:
-                raise
-
-    def _fetch_with_selenium(self, url: str) -> str:
-        """Fetch page with Selenium and return rendered HTML."""
-        driver = None
-        try:
-            driver = self._create_driver()
-            driver.set_page_load_timeout(20)
-            driver.get(url)
-
-            wait = WebDriverWait(driver, 15)
-            try:
-                wait.until(lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0)
-            except:
-                pass
-
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-
-            return driver.page_source
-
-        finally:
-            if driver:
-                driver.quit()
+            self.log("error", f"Fetch error for {url}: {str(e)}")
+            return ""
 
     def _get_atlas_urls(self) -> List[str]:
         """Build list of regional atlas URLs to scrape."""
@@ -482,21 +447,21 @@ class AzubicaScraper(BaseScraper):
 
             self.log("info", f"Fetching Azubica atlas: {url}")
 
-            loop = asyncio.get_running_loop()
-            try:
-                html = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._fetch_with_selenium, url),
-                    timeout=25.0,
-                )
-            except asyncio.TimeoutError:
-                self.log("error", f"Timeout fetching {url}")
-                continue
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                try:
+                    html = await asyncio.wait_for(
+                        self._fetch(client, url),
+                        timeout=20.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.log("error", f"Timeout fetching {url}")
+                    continue
 
-            if not html:
-                self.log("error", f"Failed to fetch {url}")
-                continue
+                if not html:
+                    self.log("error", f"Failed to fetch {url}")
+                    continue
 
-            companies = self._parse_companies_from_atlas(html)
+                companies = self._parse_companies_from_atlas(html)
             self.log("info", f"Found {len(companies)} potential companies on page")
 
             for job in companies:

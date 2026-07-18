@@ -5,6 +5,7 @@ import json
 import httpx
 from typing import List, Optional, Callable
 from app.services.scraper_base import BaseScraper
+from app.services.contact_finder import find_email_on_company_website
 
 BASE_URL = "https://www.linkedin.com"
 SEARCH_URL = f"{BASE_URL}/jobs-guest/jobs/api/seeMoreJobPostings/search"
@@ -279,6 +280,18 @@ class LinkedInScraper(BaseScraper):
         website = self._extract_website(description) or employer_website
 
         self.log("info", f"Company '{employer_name}': email='{email}'")
+
+        if not email and employer_website:
+            self.log("info", f"No email in description for '{employer_name}', checking website {employer_website}...")
+            try:
+                email = await asyncio.wait_for(
+                    find_email_on_company_website(
+                        client, employer_website, self._headers(), log=self.log
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("info", f"Website lookup timed out for '{employer_name}'")
 
         self._add_company(employer_name, email, city, website, phone, job_title)
 
