@@ -1,43 +1,17 @@
-"""LinkedIn Scraper - Uses public guest API (no login required)."""
+"""LinkedIn Scraper - HTML scraping."""
 import asyncio
-import re
-import json
 import httpx
+from bs4 import BeautifulSoup
 from typing import List, Optional, Callable
+from urllib.parse import urljoin
+
 from app.services.scraper_base import BaseScraper
-from app.services.contact_finder import find_email_on_company_website
-
-BASE_URL = "https://www.linkedin.com"
-SEARCH_URL = f"{BASE_URL}/jobs-guest/jobs/api/seeMoreJobPostings/search"
-
-JOB_TYPE_MAP = {
-    "Vollzeit": "F",
-    "Teilzeit": "P",
-    "Praktikum": "I",
-    "Werkstudent": "I",
-    "Ausbildung": "I",
-    "Vertrag": "C",
-    "Temporär": "T",
-}
-
-DATE_FILTER_MAP = {
-    "Alle anzeigen": None,
-    "Heute": "r86400",
-    "Letzte Woche": "r604800",
-    "Letzter Monat": "r2592000",
-}
-
-RADIUS_MAP = {
-    "Ganzer Ort": None,
-    "5 km": "5",
-    "10 km": "10",
-    "25 km": "25",
-    "50 km": "50",
-    "100 km": "100",
-}
+from app.services.contact_finder import find_email_on_company_website, extract_emails_from_html
 
 
 class LinkedInScraper(BaseScraper):
+    BASE_URL = "https://www.linkedin.com"
+
     def __init__(self, profession: str, location: str = "", location_scope: str = "Ganzer Ort",
                  job_type: str = "Praktikum", date_filter: str = "Heute",
                  max_results: int = 50, field_tags: List[str] = None, log_callback: Optional[Callable] = None):
@@ -50,290 +24,187 @@ class LinkedInScraper(BaseScraper):
         return {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
         }
 
-    def _build_search_params(self, start: int = 0) -> dict:
-        params = {"keywords": self.profession, "start": start}
+    def _build_search_url(self, page: int = 1) -> str:
+        params = [f"keywords={self.profession.replace(' ', '%20')}"]
         if self.location and self.location.strip():
-            params["location"] = self.location.strip()
-            radius = RADIUS_MAP.get(self.location_scope)
-            if radius:
-                params["distance"] = radius
-        job_code = JOB_TYPE_MAP.get(self.job_type)
-        if job_code:
-            params["f_JT"] = job_code
-        time_filter = DATE_FILTER_MAP.get(self.date_filter)
-        if time_filter:
-            params["f_TPR"] = time_filter
-        return params
+            params.append(f"location={self.location.strip().replace(' ', '%20')}")
 
-    def _parse_search_results(self, html: str) -> List[dict]:
-        jobs = []
-        cards = re.findall(
-            r'<div[^>]*class="[^"]*result-card[^"]*"[^>]*>(.*?)</div>\s*</div>\s*</div>',
-            html, re.DOTALL
-        )
+        # Job type mapping (LinkedIn uses f_* parameters)
+        job_type_map = {
+            "Vollzeit": "f_JT=F",
+            "Teilzeit": "f_JT=P",
+            "Praktikum": "f_JT=I",
+            "Werkstudent": "f_JT=C",
+            "Ausbildung": "f_JT=A",
+            "Vertrag": "f_JT=C",
+            "Temporär": "f_JT=T",
+        }
+        if self.job_type in job_type_map:
+            params.append(job_type_map[self.job_type])
 
-        if not cards:
-            cards = re.findall(
-                r'<div[^>]*class="[^"]*base-search-card[^"]*"[^>]*>(.*?)</div>\s*</div>\s*</div>',
-                html, re.DOTALL
-            )
+        params.append(f"start={(page-1)*25}")
+        query = "&".join(params)
+        return f"{self.BASE_URL}/jobs/search/?{query}"
 
-        if not cards:
-            cards = re.findall(
-                r'<li[^>]*class="[^"]*job-search-card[^"]*"[^>]*>(.*?)</li>',
-                html, re.DOTALL
-            )
-
-        for card in cards:
-            job = self._parse_job_card(card)
-            if job:
-                jobs.append(job)
-
-        return jobs
-
-    def _parse_job_card(self, card_html: str) -> dict:
-        job = {}
-
-        urn_match = re.search(r'data-entity-urn="urn:li:jobPosting:(\d+)"', card_html)
-        if urn_match:
-            job["job_id"] = urn_match.group(1)
-        else:
-            href_match = re.search(r'href="(/jobs/view/\d+)"', card_html)
-            if href_match:
-                job_id_match = re.search(r'/jobs/view/(\d+)', href_match.group(1))
-                if job_id_match:
-                    job["job_id"] = job_id_match.group(1)
-
-        company_match = re.search(r'class="[^"]*base-search-card__subtitle[^"]*"[^>]*>(.*?)</span>', card_html)
-        if company_match:
-            job["company"] = re.sub(r'<[^>]+>', '', company_match.group(1)).strip()
-        else:
-            company_match = re.search(r'class="[^"]*result-card__subtitle[^"]*"[^>]*>(.*?)</span>', card_html)
-            if company_match:
-                job["company"] = re.sub(r'<[^>]+>', '', company_match.group(1)).strip()
-
-        title_match = re.search(r'class="[^"]*base-search-card__title[^"]*"[^>]*>(.*?)</span>', card_html)
-        if title_match:
-            job["title"] = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-        else:
-            title_match = re.search(r'class="[^"]*result-card__title[^"]*"[^>]*>(.*?)</span>', card_html)
-            if title_match:
-                job["title"] = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-
-        loc_match = re.search(r'class="[^"]*job-search-card__location[^"]*"[^>]*>(.*?)</span>', card_html)
-        if loc_match:
-            job["location"] = re.sub(r'<[^>]+>', '', loc_match.group(1)).strip()
-        else:
-            loc_match = re.search(r'class="[^"]*base-search-card__metadata[^"]*"[^>]*>(.*?)</span>', card_html)
-            if loc_match:
-                job["location"] = re.sub(r'<[^>]+>', '', loc_match.group(1)).strip()
-
-        if job.get("company") and job.get("job_id"):
-            return job
-        return None
-
-    async def _search_jobs(self, client: httpx.AsyncClient, start: int = 0) -> List[dict]:
-        params = self._build_search_params(start=start)
-        self.log("info", f"GET {SEARCH_URL} | start={start} | keywords={self.profession}")
+    async def _fetch(self, client: httpx.AsyncClient, url: str) -> str:
         try:
-            resp = await client.get(SEARCH_URL, params=params, headers=self._headers(), timeout=15.0)
-            resp.raise_for_status()
-            html = resp.text
-            jobs = self._parse_search_results(html)
-            self.log("success", f"Page start={start}: {len(jobs)} jobs found")
-            return jobs
-        except httpx.HTTPStatusError as e:
-            self.log("error", f"HTTP {e.response.status_code}: {e.response.text[:300]}")
-            return []
-        except Exception as e:
-            self.log("error", f"Search exception: {type(e).__name__}: {str(e)}")
-            return []
-
-    async def _get_job_details(self, client: httpx.AsyncClient, job_id: str):
-        url = f"{BASE_URL}/jobs-guest/jobs/api/jobPosting/{job_id}"
-        try:
-            resp = await client.get(url, headers=self._headers(), timeout=10.0)
+            resp = await client.get(url, headers=self._headers(), timeout=15.0, follow_redirects=True)
             resp.raise_for_status()
             return resp.text
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                self.log("info", f"Details 404 for job {job_id}")
-            else:
-                self.log("error", f"Details HTTP {e.response.status_code}")
-            return None
         except Exception as e:
-            self.log("error", f"Details exception: {str(e)}")
-            return None
-
-    def _extract_description_from_html(self, html: str) -> str:
-        jsonld_match = re.search(
-            r'<script type="application/ld\+json">(.*?)</script>',
-            html, re.DOTALL
-        )
-        if jsonld_match:
-            try:
-                data = json.loads(jsonld_match.group(1))
-                if isinstance(data, dict):
-                    desc = data.get("description", "")
-                    if desc:
-                        desc = re.sub(r'<[^>]+>', ' ', desc)
-                        desc = re.sub(r'\s+', ' ', desc).strip()
-                        return desc
-            except json.JSONDecodeError:
-                pass
-
-        desc_match = re.search(
-            r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<script|$)',
-            html, re.DOTALL
-        )
-        if desc_match:
-            desc = desc_match.group(1)
-            desc = re.sub(r'<[^>]+>', ' ', desc)
-            desc = re.sub(r'\s+', ' ', desc).strip()
-            return desc
-
-        desc_match = re.search(
-            r'class="show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>',
-            html, re.DOTALL
-        )
-        if desc_match:
-            desc = desc_match.group(1)
-            desc = re.sub(r'<[^>]+>', ' ', desc)
-            desc = re.sub(r'\s+', ' ', desc).strip()
-            return desc
-
-        return ""
-
-    def _extract_company_website_from_html(self, html: str) -> str:
-        jsonld_match = re.search(
-            r'<script type="application/ld\+json">(.*?)</script>',
-            html, re.DOTALL
-        )
-        if jsonld_match:
-            try:
-                data = json.loads(jsonld_match.group(1))
-                if isinstance(data, dict):
-                    hiring_org = data.get("hiringOrganization", {})
-                    if isinstance(hiring_org, dict):
-                        url = hiring_org.get("sameAs", "")
-                        if url and url.startswith("http"):
-                            return url
-            except json.JSONDecodeError:
-                pass
-
-        website_match = re.search(r'href="(https?://[^"]+)"[^>]*class="[^"]*company[^"]*"', html)
-        if website_match:
-            return website_match.group(1)
-
-        return ""
-
-    def _get_city_from_location(self, location: str) -> str:
-        if not location:
+            self.log("error", f"Fetch error for {url}: {str(e)}")
             return ""
-        parts = location.split(",")
-        return parts[0].strip()
 
-    async def _process_job(self, client: httpx.AsyncClient, job: dict):
-        job_id = job.get("job_id", "")
-        if not job_id:
-            self.log("info", "Skipping: no job_id")
-            return
+    def _parse_job_links(self, html: str) -> List[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        seen = set()
 
-        employer_name = job.get("company", "")
-        if not employer_name or not isinstance(employer_name, str):
-            self.log("info", "Skipping: invalid company name")
-            return
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/jobs/view/" in href:
+                full = urljoin(self.BASE_URL, href)
+                if full not in seen:
+                    seen.add(full)
+                    links.append(full)
 
-        job_title = job.get("title", "")
-        location = job.get("location", "")
-        city = self._get_city_from_location(location)
+        if not links:
+            self.log("error", "No job links found. LinkedIn may require login or markup changed.")
+        else:
+            self.log("info", f"Found {len(links)} job links on page.")
+        return links
 
-        dedup = self._dedup_key(employer_name, city)
-        if dedup in self.seen_companies:
-            self.log("info", f"Skipping duplicate: {employer_name}")
-            return
-        self.seen_companies.add(dedup)
+    def _parse_detail(self, html: str) -> dict:
+        soup = BeautifulSoup(html, "html.parser")
 
-        description = ""
-        employer_website = ""
+        title = ""
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
 
-        try:
-            html = await asyncio.wait_for(
-                self._get_job_details(client, job_id),
-                timeout=8.0
-            )
+        company_name = ""
+        for sel in ["[data-testid='company-name']", ".company-name", ".topcard__org-name-link"]:
+            el = soup.select_one(sel)
+            if el:
+                company_name = el.get_text(strip=True)
+                break
 
-            if html:
-                description = self._extract_description_from_html(html)
-                employer_website = self._extract_company_website_from_html(html)
-        except asyncio.TimeoutError:
-            self.log("info", f"Detail timeout for {job_id}")
-        except Exception as e:
-            self.log("info", f"Detail error: {str(e)}")
+        if not company_name:
+            full_text = soup.get_text(" ", strip=True)
+            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.-\s]{2,60})", full_text)
+            if m:
+                company_name = m.group(1).strip()
 
-        email = self._extract_email(description)
-        phone = self._extract_phone(description)
-        website = self._extract_website(description) or employer_website
+        city = ""
+        full_text = soup.get_text(" ", strip=True)
+        m = re.search(r"\b\d{5}\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\-\. ]{1,40})", full_text)
+        if m:
+            city = m.group(1).strip()
 
-        self.log("info", f"Company '{employer_name}': email='{email}'")
+        company_website = ""
+        excluded = ("linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and not any(d in href for d in excluded):
+                company_website = href
+                break
 
-        if not email and employer_website:
-            self.log("info", f"No email in description for '{employer_name}', checking website {employer_website}...")
+        page_emails = extract_emails_from_html(html)
+        direct_email = page_emails[0] if page_emails else ""
+        phone = self._extract_phone(full_text)
+
+        return {
+            "name": company_name or "",
+            "title": title,
+            "city": city,
+            "website": company_website,
+            "phone": phone,
+            "email": direct_email,
+        }
+
+    async def _process_job(self, client: httpx.AsyncClient, link: str) -> Optional[dict]:
+        if self._should_stop():
+            return None
+
+        detail_html = await self._fetch(client, link)
+        if not detail_html:
+            return None
+
+        job = self._parse_detail(detail_html)
+
+        if not job["name"]:
+            self.log("info", f"Skipping (no company name): {link}")
+            return None
+
+        self._set_current(job["name"], job["website"])
+
+        email = job["email"]
+
+        if not email and job["website"]:
+            self.log("info", f"No email on offer for '{job['name']}', checking website {job['website']}...")
             try:
                 email = await asyncio.wait_for(
                     find_email_on_company_website(
-                        client, employer_website, self._headers(), log=self.log
+                        client, job["website"], self._headers(), log=self.log
                     ),
-                    timeout=10.0,
+                    timeout=8.0,
                 )
             except asyncio.TimeoutError:
-                self.log("info", f"Website lookup timed out for '{employer_name}'")
+                self.log("info", f"Website lookup timed out for '{job['name']}'")
 
-        self._add_company(employer_name, email, city, website, phone, job_title)
+        if not email:
+            self.log("info", f"DISCARDED '{job['name']}': no email found")
+            return None
+
+        self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
+        return {"done": True}
 
     async def scrape(self) -> List[dict]:
         self.log("info", "=== LinkedIn Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
         self.log("info", f"Max results: {self.max_results}")
-        self.log("info", "Note: Only companies WITH email will be kept")
+        self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
+        self.log("info", "WARNING: LinkedIn often blocks scrapers. Results may be limited.")
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            start = 0
-            total_fetched = 0
-            max_pages = 10
+            page = 1
+            max_pages = 3  # LinkedIn is more aggressive with blocking
 
-            while total_fetched < self.max_results and start < max_pages * 25:
-                jobs = await self._search_jobs(client, start=start)
-
-                if not jobs:
-                    self.log("info", "No jobs returned from page.")
+            while page <= max_pages:
+                if self._should_stop():
                     break
 
-                self.log("info", f"Processing {len(jobs)} jobs from start={start}...")
-
-                for job in jobs:
-                    if total_fetched >= self.max_results:
-                        break
-                    await self._process_job(client, job)
-                    total_fetched = len(self.companies)
-
-                self.log("info", f"Current companies with email: {total_fetched}")
-
-                if len(jobs) < 25:
-                    self.log("info", f"Last page reached ({len(jobs)} < 25).")
+                url = self._build_search_url(page)
+                self.log("info", f"Fetching LinkedIn page {page}: {url}")
+                html = await self._fetch(client, url)
+                if not html:
                     break
 
-                start += 25
-                await asyncio.sleep(2.0)
+                links = self._parse_job_links(html)
+                if not links:
+                    break
 
-            if start >= max_pages * 25:
-                self.log("info", f"Max page limit ({max_pages}) reached.")
+                semaphore = asyncio.Semaphore(4)  # Lower concurrency for LinkedIn
+                async def limited_process(link: str) -> Optional[dict]:
+                    async with semaphore:
+                        if self._should_stop():
+                            return None
+                        return await self._process_job(client, link)
 
-        self.log("info", "=== Scraping Complete ===")
-        self.log("info", f"Total unique companies with email: {len(self.companies)}")
+                tasks = [limited_process(link) for link in links[:self.target_max]]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+                if len(links) < 25:
+                    self.log("info", "Fewer than 25 job links -- likely last page.")
+                    break
+
+                page += 1
+                await asyncio.sleep(1.0)  # Slower for LinkedIn
+
+        self.log("info", "=== LinkedIn Scraping Complete ===")
+        self.log("info", f"Total companies with email: {len(self.companies)}")
         return self.get_results()

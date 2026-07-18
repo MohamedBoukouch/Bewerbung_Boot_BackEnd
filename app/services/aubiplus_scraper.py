@@ -8,7 +8,7 @@ are DISCARDED.
 """
 import asyncio
 import re
-from typing import List, Optional, Callable, Dict, Any
+from typing import List, Optional, Callable
 from urllib.parse import urljoin
 
 import httpx
@@ -94,7 +94,7 @@ class AubiPlusScraper(BaseScraper):
 
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
-            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.\- ]{2,60})", full_text)
+            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.-\s]{2,60})", full_text)
             if m:
                 company_name = m.group(1).strip()
 
@@ -141,6 +141,10 @@ class AubiPlusScraper(BaseScraper):
         }
 
     async def _process_job(self, client: httpx.AsyncClient, link: str) -> Optional[dict]:
+        # HARD STOP check
+        if self._should_stop():
+            return None
+
         detail_html = await self._fetch(client, link)
         if not detail_html:
             return None
@@ -151,11 +155,7 @@ class AubiPlusScraper(BaseScraper):
             self.log("info", f"Skipping (no company name): {link}")
             return None
 
-        dedup = self._dedup_key(job["name"], job["city"])
-        if dedup in self.seen_companies:
-            self.log("info", f"Skipping duplicate: {job['name']}")
-            return None
-        self.seen_companies.add(dedup)
+        self._set_current(job["name"], job["website"])
 
         email = job["email"]
 
@@ -175,22 +175,8 @@ class AubiPlusScraper(BaseScraper):
             self.log("info", f"DISCARDED '{job['name']}': no email found (offer + website tried)")
             return None
 
-        if self._is_already_extracted(email):
-            self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
-            return None
-
-        self.log("info", f"KEPT '{job['name']}': email='{email}' | city='{job['city']}'")
-
-        return {
-            "company_name": job["name"],
-            "email": email,
-            "city": job["city"],
-            "website": job["website"],
-            "phone": job["phone"],
-            "job_title": job["title"],
-            "field": self.profession,
-            "source": "aubiplus",
-        }
+        self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
+        return {"done": True}
 
     async def scrape(self) -> List[dict]:
         self.log("info", "=== AubiPlus Scraping Start ===")
@@ -204,7 +190,11 @@ class AubiPlusScraper(BaseScraper):
             max_pages = 5
             all_links: List[str] = []
 
-            while len(all_links) < self.max_results * 2 and page <= max_pages:
+            while len(all_links) < self.target_max * 3 and page <= max_pages:
+                # HARD STOP check
+                if self._should_stop():
+                    break
+
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching AubiPlus page {page}: {url}")
                 html = await self._fetch(client, url)
@@ -233,19 +223,12 @@ class AubiPlusScraper(BaseScraper):
             semaphore = asyncio.Semaphore(8)
             async def limited_process(link: str) -> Optional[dict]:
                 async with semaphore:
+                    if self._should_stop():
+                        return None
                     return await self._process_job(client, link)
 
-            tasks = [limited_process(link) for link in all_links[: self.max_results * 2]]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    self.log("error", f"Task exception: {result}")
-                    continue
-                if result:
-                    self.companies.append(result)
-                    if len(self.companies) >= self.max_results:
-                        break
+            tasks = [limited_process(link) for link in all_links[:self.target_max * 3]]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         self.log("info", "=== AubiPlus Scraping Complete ===")
         self.log("info", f"Total companies with email: {len(self.companies)}")

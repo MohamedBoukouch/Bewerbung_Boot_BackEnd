@@ -11,20 +11,19 @@ except Exception:
 
 class BaseScraper:
     def __init__(self, profession: str, location: str = "", max_results: int = 50,
-                 field_tags: List[str] = None, log_callback: Optional[Callable] = None,
-                 already_extracted_emails: List[str] = None):
+                 field_tags: List[str] = None, log_callback: Optional[Callable] = None):
         self.profession = profession
         self.location = location
         self.max_results = max_results
+        self.target_max = max_results  # EXACT target - never exceed this
         self.field_tags = field_tags or []
         self.log_callback = log_callback
         self.companies = []
-        self.seen_companies = set()
+        self.seen_companies = set()  # For dedup within current scrape only
         self.source_label = ""
         self.current_company = ""
         self.current_logo_url = ""
         self.pages_fetched = 0
-        self.already_extracted_emails = set(e.lower() for e in (already_extracted_emails or []) if e)
 
     def log(self, type_: str, message: str):
         if self.log_callback:
@@ -51,11 +50,6 @@ class BaseScraper:
     def _dedup_key(self, name: str, city: str) -> str:
         return f"{name.strip().lower()}|{city.strip().lower()}"
 
-    def _is_already_extracted(self, email: str) -> bool:
-        if not email or not self.already_extracted_emails:
-            return False
-        return email.lower() in self.already_extracted_emails
-
     def _favicon_url(self, website: str) -> str:
         """Best-effort: derive a favicon URL from the company website."""
         if not website:
@@ -68,10 +62,21 @@ class BaseScraper:
     def _extract_email(self, text: str) -> str:
         if not text:
             return ""
-        # Match email patterns
+        # Match email patterns - improved to avoid common false positives
         pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
         matches = re.findall(pattern, text)
-        return matches[0] if matches else ""
+        # Filter out invalid/common false positives
+        valid = []
+        for m in matches:
+            m_lower = m.lower()
+            # Skip common image/template placeholders
+            if any(bad in m_lower for bad in ['example.com', 'domain.com', 'yourdomain', 'test.com', 'sample.com']):
+                continue
+            # Skip overly long emails (likely not real)
+            if len(m) > 60:
+                continue
+            valid.append(m)
+        return valid[0] if valid else ""
 
     def _extract_phone(self, text: str) -> str:
         if not text:
@@ -109,8 +114,19 @@ class BaseScraper:
         self.current_logo_url = self._favicon_url(website)
         self._progress()
 
+    def _should_stop(self) -> bool:
+        """Check if we've reached the exact target limit."""
+        return len(self.companies) >= self.target_max
+
     def _add_company(self, name: str, email: str, city: str, website: str, phone: str, job_title: str):
-        """Add company to results. ONLY if email is present and not already extracted."""
+        """Add company to results. ONLY if email is present.
+        NO "already extracted" check - we extract ALL emails even if duplicate.
+        But we DO dedup within the current scrape to avoid exact duplicates."""
+
+        # HARD STOP if we already reached exact limit
+        if len(self.companies) >= self.target_max:
+            return
+
         name = name.strip()
         email = (email or "").strip()
 
@@ -118,28 +134,33 @@ class BaseScraper:
             self.log("info", "Skipping: empty company name")
             return
 
-        # ✅ FILTER: Only keep companies WITH email
+        # FILTER: Only keep companies WITH email
         if not email:
             self.log("info", f"Skipping '{name}': no email found")
             return
 
-        # ✅ FILTER: Skip already extracted emails
-        if self._is_already_extracted(email):
-            self.log("info", f"Skipping '{name}': email '{email}' already extracted previously")
+        # DEDUP: Skip only if EXACT same name+city in CURRENT scrape
+        dedup_key = self._dedup_key(name, city)
+        if dedup_key in self.seen_companies:
+            self.log("info", f"Skipping duplicate in current scrape: {name} ({city})")
             return
+        self.seen_companies.add(dedup_key)
 
         # Field tags as comma-separated string
         field = ", ".join(self.field_tags) if self.field_tags else self.profession
 
         company = {
+            "company_name": name,  # Consistent key name
             "name": name,
             "email": email,
             "city": city or "",
             "field": field,
             "website": website or "",
             "phone": phone or "",
+            "job_title": job_title or "",
             "jobTitle": job_title or "",
             "logoUrl": self._favicon_url(website),
+            "source": getattr(self, 'source_label', ''),
         }
 
         self.companies.append(company)
@@ -147,4 +168,5 @@ class BaseScraper:
         self._progress()
 
     def get_results(self) -> List[dict]:
-        return self.companies
+        """Return results, strictly limited to target_max."""
+        return self.companies[:self.target_max]

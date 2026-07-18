@@ -120,13 +120,17 @@ class ArbeitsagenturScraper(BaseScraper):
         return job.get("ort", "") or job.get("einsatzort", "") or ""
 
     async def _process_job(self, client: httpx.AsyncClient, job: dict):
+        # HARD STOP check
+        if self._should_stop():
+            return
+
         referenznummer = job.get("referenznummer", "")
         if not referenznummer:
             self.log("info", "Skipping: no referenznummer")
             return
 
         employer_name = job.get("firma", "")
-        
+
         if not employer_name or not isinstance(employer_name, str):
             self.log("info", f"Skipping: invalid firma")
             return
@@ -139,12 +143,6 @@ class ArbeitsagenturScraper(BaseScraper):
         )
 
         city = self._get_city_from_job(job)
-
-        dedup = self._dedup_key(employer_name, city)
-        if dedup in self.seen_companies:
-            self.log("info", f"Skipping duplicate: {employer_name}")
-            return
-        self.seen_companies.add(dedup)
 
         # Try to get details with timeout
         description = ""
@@ -199,6 +197,7 @@ class ArbeitsagenturScraper(BaseScraper):
             except asyncio.TimeoutError:
                 self.log("info", f"Website lookup timed out for '{employer_name}'")
 
+        # Use _add_company which handles dedup and limit
         self._add_company(employer_name, email, city, website, phone, job_title)
 
     async def scrape(self) -> List[dict]:
@@ -212,9 +211,14 @@ class ArbeitsagenturScraper(BaseScraper):
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
             total_fetched = 0
-            max_pages = 5  # Search up to 5 pages to find enough emails
+            max_pages = 10  # Increased to find enough emails
 
-            while total_fetched < self.max_results and page <= max_pages:
+            while total_fetched < self.target_max and page <= max_pages:
+                # HARD STOP check before fetching next page
+                if self._should_stop():
+                    self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
+                    break
+
                 jobs = await self._search_jobs(client, page=page)
                 self.pages_fetched = page
 
@@ -226,7 +230,8 @@ class ArbeitsagenturScraper(BaseScraper):
 
                 # Process jobs sequentially
                 for job in jobs:
-                    if total_fetched >= self.max_results:
+                    if self._should_stop():
+                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
                         break
                     await self._process_job(client, job)
                     total_fetched = len(self.companies)

@@ -139,7 +139,7 @@ class AzubiyoScraper(BaseScraper):
 
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
-            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.\-\s]{2,60})", full_text)
+            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.-\s]{2,60})", full_text)
             if m:
                 company_name = m.group(1).strip()
 
@@ -192,7 +192,7 @@ class AzubiyoScraper(BaseScraper):
         max_details_per_page = 8
 
         try:
-            while len(self.companies) < self.max_results and page <= max_pages:
+            while len(self.companies) < self.target_max and page <= max_pages:
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching Azubiyo page {page}: {url}")
 
@@ -214,7 +214,8 @@ class AzubiyoScraper(BaseScraper):
 
                 details_fetched = 0
                 for link in job_links:
-                    if len(self.companies) >= self.max_results:
+                    if self._should_stop():
+                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
                         break
 
                     if details_fetched >= max_details_per_page:
@@ -237,11 +238,7 @@ class AzubiyoScraper(BaseScraper):
                         self.log("info", f"Skipping (no company name): {link}")
                         continue
 
-                    dedup = self._dedup_key(job["name"], job["city"])
-                    if dedup in self.seen_companies:
-                        self.log("info", f"Skipping duplicate: {job['name']}")
-                        continue
-                    self.seen_companies.add(dedup)
+                    self._set_current(job["name"], job["website"])
 
                     email = job["email"]
 
@@ -264,22 +261,7 @@ class AzubiyoScraper(BaseScraper):
                         self.log("info", f"DISCARDED '{job['name']}': no email found")
                         continue
 
-                    if self._is_already_extracted(email):
-                        self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
-                        continue
-
-                    self.log("info", f"KEPT '{job['name']}': email='{email}'")
-
-                    self.companies.append({
-                        "company_name": job["name"],
-                        "email": email,
-                        "city": job["city"],
-                        "website": job["website"],
-                        "phone": job["phone"],
-                        "job_title": job["title"],
-                        "field": self.profession,
-                        "source": "azubiyo",
-                    })
+                    self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
 
                 self.log("info", f"Current companies with email: {len(self.companies)}")
                 page += 1

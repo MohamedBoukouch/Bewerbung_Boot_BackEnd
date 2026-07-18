@@ -91,7 +91,6 @@ class ExtractPayload(BaseModel):
     config: ExtractConfig
     fieldTags: List[str]
     maxResults: int = 50
-    alreadyExtractedEmails: List[str] = []
 
 
 class ExtractResponse(BaseModel):
@@ -110,7 +109,7 @@ def _get_profession(config: ExtractConfig, fieldTags: List[str]) -> str:
     return profession
 
 
-def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[str], maxResults: int, add_log, already_extracted_emails: List[str] = None) -> Dict[str, Any]:
+def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[str], maxResults: int, add_log) -> Dict[str, Any]:
     """Build kwargs dynamically based on source type."""
     profession = _get_profession(config, fieldTags)
 
@@ -121,9 +120,6 @@ def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[st
         "field_tags": fieldTags,
         "log_callback": add_log,
     }
-
-    if already_extracted_emails:
-        kwargs["already_extracted_emails"] = already_extracted_emails
 
     if source in ("arbeitsagentur", "indeed", "linkedin", "xing"):
         kwargs["location_scope"] = config.locationScope or "Ganzer Ort"
@@ -201,7 +197,6 @@ async def extract_data(payload: ExtractPayload):
             fieldTags=payload.fieldTags,
             maxResults=payload.maxResults,
             add_log=add_log,
-            already_extracted_emails=payload.alreadyExtractedEmails or [],
         )
 
         # Filter kwargs to only include what the scraper accepts
@@ -213,15 +208,20 @@ async def extract_data(payload: ExtractPayload):
 
         scraper = ScraperClass(**filtered_kwargs)
         scraper.source_label = payload.source
-        scraper.already_extracted_emails = set(
-            e.lower() for e in (payload.alreadyExtractedEmails or []) if e
-        )
+        scraper.target_max = payload.maxResults  # EXACT limit target
+
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(True, payload.source, "", "", 0, 0, "running")
         except Exception:
             pass
-        companies = await asyncio.wait_for(scraper.scrape(), timeout=90.0)
+
+        companies = await asyncio.wait_for(scraper.scrape(), timeout=300.0)
+
+        # STRICT LIMIT: Slice to exact maxResults requested
+        if len(companies) > payload.maxResults:
+            add_log("info", f"Found {len(companies)} companies, limiting to exact {payload.maxResults} requested.")
+            companies = companies[:payload.maxResults]
 
         add_log("success", f"Extraction complete! {len(companies)} companies with email found.")
 
@@ -240,7 +240,7 @@ async def extract_data(payload: ExtractPayload):
         )
 
     except asyncio.TimeoutError:
-        add_log("error", "Scrape timed out after 50 seconds.")
+        add_log("error", "Scrape timed out after 5 minutes.")
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(False, payload.source, "", "", 0, 0, "error")
@@ -251,7 +251,7 @@ async def extract_data(payload: ExtractPayload):
             companies=[],
             totalItems=0,
             logs=logs,
-            error="Scrape timed out after 50 seconds. Please try again or reduce the number of results."
+            error="Scrape timed out after 5 minutes. Please try again or reduce the number of results."
         )
 
     except Exception as e:
@@ -330,9 +330,14 @@ async def test_extract():
             field_tags=["Softwareentwickler"],
             log_callback=add_log,
         )
+        scraper.target_max = 10
 
         add_log("info", "Starting scrape with 60s timeout...")
         companies = await asyncio.wait_for(scraper.scrape(), timeout=60.0)
+
+        # STRICT LIMIT
+        if len(companies) > 10:
+            companies = companies[:10]
 
         add_log("success", f"Scrape complete! {len(companies)} companies with email found.")
 

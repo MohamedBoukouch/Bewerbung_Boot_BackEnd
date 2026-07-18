@@ -440,6 +440,10 @@ class AzubicaScraper(BaseScraper):
             all_companies: List[dict] = []
 
             for url in atlas_urls:
+                # HARD STOP check
+                if self._should_stop():
+                    break
+
                 self.log("info", f"Fetching Azubica atlas: {url}")
 
                 try:
@@ -467,52 +471,30 @@ class AzubicaScraper(BaseScraper):
 
             semaphore = asyncio.Semaphore(8)
             async def process_company(job: dict) -> Optional[dict]:
-                if not job["name"]:
+                if self._should_stop():
                     return None
 
-                dedup = self._dedup_key(job["name"], job["city"])
-                if dedup in self.seen_companies:
+                if not job["name"]:
                     return None
-                self.seen_companies.add(dedup)
 
                 email = job["email"]
 
                 if not email and job["website"]:
                     async with semaphore:
+                        if self._should_stop():
+                            return None
                         email = await self._lookup_email(client, job["website"])
 
                 if not email:
                     self.log("info", f"DISCARDED '{job['name']}': no email found")
                     return None
 
-                if self._is_already_extracted(email):
-                    self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
-                    return None
+                self._set_current(job["name"], job["website"])
+                self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"] or self.profession)
+                return {"done": True}
 
-                self.log("info", f"KEPT '{job['name']}': email='{email}'")
-
-                return {
-                    "company_name": job["name"],
-                    "email": email,
-                    "city": job["city"],
-                    "website": job["website"],
-                    "phone": job["phone"],
-                    "job_title": job["title"] or self.profession,
-                    "field": self.profession,
-                    "source": "azubica",
-                }
-
-            tasks = [process_company(job) for job in all_companies[: self.max_results * 3]]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    self.log("error", f"Task exception: {result}")
-                    continue
-                if result:
-                    self.companies.append(result)
-                    if len(self.companies) >= self.max_results:
-                        break
+            tasks = [process_company(job) for job in all_companies[:self.target_max * 3]]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         self.log("info", "=== Azubica Scraping Complete ===")
         self.log("info", f"Total companies with email: {len(self.companies)}")

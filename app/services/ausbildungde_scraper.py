@@ -64,7 +64,7 @@ class AusbildungDeScraper(BaseScraper):
             cards = soup.find_all("div", class_=lambda x: x and ("job" in x.lower() or "card" in x.lower() or "result" in x.lower() or "stelle" in x.lower() or "platz" in x.lower()))
             self.log("info", f"Fallback: found {len(cards)} potential cards")
 
-        for card in cards[:self.max_results]:
+        for card in cards[:self.target_max]:  # Use target_max instead of max_results
             job = self._parse_card(card)
             if job:
                 jobs.append(job)
@@ -127,7 +127,11 @@ class AusbildungDeScraper(BaseScraper):
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
-            while len(self.companies) < self.max_results:
+            while len(self.companies) < self.target_max:  # Use target_max for exact limit
+                if self._should_stop():
+                    self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
+                    break
+
                 html = await self._fetch_page(client, page)
                 if not html:
                     break
@@ -140,7 +144,8 @@ class AusbildungDeScraper(BaseScraper):
                 self.log("info", f"Processing {len(jobs)} jobs from page {page}...")
 
                 for job in jobs:
-                    if len(self.companies) >= self.max_results:
+                    if self._should_stop():
+                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
                         break
 
                     if job.get("link"):
@@ -159,6 +164,7 @@ class AusbildungDeScraper(BaseScraper):
                         phone = job.get("phone", "")
                         website = job.get("website", "")
 
+                    self._set_current(job["name"], website)
                     self._add_company(job["name"], email, job.get("city", ""), website, phone, job.get("title", ""))
 
                 if len(jobs) < 10:
