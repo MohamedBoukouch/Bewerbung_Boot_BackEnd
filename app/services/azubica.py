@@ -1,8 +1,7 @@
 """Azubica Scraper v2 - Scrapes regional Ausbildungsatlas pages
 
 Azubica.de is a regional Ausbildungsatlas platform (PDF magazine), NOT a searchable job board.
-Strategy: Try to search for jobs, scrape regional atlas pages for company listings,
-then find emails via company websites.
+Strategy: Scrape regional atlas pages for company listings, then find emails via company websites.
 """
 import asyncio
 import re
@@ -20,7 +19,6 @@ POSTAL_CITY_RE = re.compile(r"\b\d{5}\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\-\. ]{
 class AzubicaScraper(BaseScraper):
     BASE_URL = "https://www.azubica.de"
 
-    # Regional atlas URL slugs (city -> slug)
     REGION_MAP = {
         "berlin": "ausbildungsatlas-berlin",
         "hamburg": "ausbildungsatlas-hamburg",
@@ -287,17 +285,14 @@ class AzubicaScraper(BaseScraper):
             return ""
 
     def _get_atlas_urls(self) -> List[str]:
-        """Build list of regional atlas URLs to scrape."""
         urls = []
 
         if self.location:
             loc = self.location.strip().lower()
-            # Exact match
             if loc in self.REGION_MAP:
                 slug = self.REGION_MAP[loc]
                 urls.append(f"{self.BASE_URL}/{slug}/")
             else:
-                # Partial match
                 for key, slug in self.REGION_MAP.items():
                     if loc in key or key in loc:
                         urls.append(f"{self.BASE_URL}/{slug}/")
@@ -313,12 +308,9 @@ class AzubicaScraper(BaseScraper):
         return urls
 
     def _parse_companies_from_atlas(self, html: str) -> List[dict]:
-        """Extract company data from atlas page HTML."""
         soup = BeautifulSoup(html, "html.parser")
         companies = []
 
-        # Azubica pages have company listings in various formats
-        # Try to find company containers
         selectors = [
             ".company", ".company-item", ".employer", ".employer-item",
             ".ausbildungsbetrieb", ".betrieb", ".firmen-entry",
@@ -338,7 +330,6 @@ class AzubicaScraper(BaseScraper):
                 if companies:
                     break
 
-        # Fallback: extract from all external links
         if not companies:
             self.log("info", "No structured data found, trying link extraction...")
             companies = self._extract_companies_from_links(soup)
@@ -346,13 +337,11 @@ class AzubicaScraper(BaseScraper):
         return companies
 
     def _extract_company_from_element(self, el) -> Optional[dict]:
-        """Extract company data from a single HTML element."""
         name = ""
         website = ""
         email = ""
         city = ""
 
-        # Try to find company name
         for tag in ["h2", "h3", "h4", "h5", ".name", ".title", ".company-name", "strong", "b"]:
             name_el = el.select_one(tag) if hasattr(el, 'select_one') else None
             if name_el:
@@ -363,20 +352,17 @@ class AzubicaScraper(BaseScraper):
             text = el.get_text(" ", strip=True) if hasattr(el, 'get_text') else ""
             name = text.split("\n")[0][:100]
 
-        # Try to find website
         for a in el.find_all("a", href=True) if hasattr(el, 'find_all') else []:
             href = a["href"]
             if href.startswith("http") and "azubica.de" not in href:
                 website = href
                 break
 
-        # Try to find email
         text = el.get_text(" ", strip=True) if hasattr(el, 'get_text') else ""
         emails = extract_emails_from_html(str(el))
         if emails:
             email = emails[0]
 
-        # Try to find city
         m = POSTAL_CITY_RE.search(text)
         if m:
             city = m.group(1).strip()
@@ -393,7 +379,6 @@ class AzubicaScraper(BaseScraper):
         return None
 
     def _extract_companies_from_links(self, soup) -> List[dict]:
-        """Fallback: extract companies from all external links."""
         companies = []
         seen = set()
 
@@ -426,8 +411,21 @@ class AzubicaScraper(BaseScraper):
 
         return companies
 
+    async def _lookup_email(self, client: httpx.AsyncClient, website: str) -> str:
+        try:
+            return await asyncio.wait_for(
+                find_email_on_company_website(
+                    client, website,
+                    {"User-Agent": "Mozilla/5.0"}, log=self.log
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            return ""
+        except Exception:
+            return ""
+
     async def scrape(self) -> List[dict]:
-        """Main scrape loop for Azubica regional atlases."""
         self.log("info", "=== Azubica Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
@@ -438,16 +436,12 @@ class AzubicaScraper(BaseScraper):
         atlas_urls = self._get_atlas_urls()
         self.log("info", f"Will scrape {len(atlas_urls)} atlas page(s): {atlas_urls}")
 
-        max_website_lookups = 5
-        website_lookups = 0
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            all_companies: List[dict] = []
 
-        for url in atlas_urls:
-            if len(self.companies) >= self.max_results:
-                break
+            for url in atlas_urls:
+                self.log("info", f"Fetching Azubica atlas: {url}")
 
-            self.log("info", f"Fetching Azubica atlas: {url}")
-
-            async with httpx.AsyncClient(follow_redirects=True) as client:
                 try:
                     html = await asyncio.wait_for(
                         self._fetch(client, url),
@@ -462,49 +456,42 @@ class AzubicaScraper(BaseScraper):
                     continue
 
                 companies = self._parse_companies_from_atlas(html)
-            self.log("info", f"Found {len(companies)} potential companies on page")
+                self.log("info", f"Found {len(companies)} potential companies on page")
+                all_companies.extend(companies)
 
-            for job in companies:
-                if len(self.companies) >= self.max_results:
-                    break
+            if not all_companies:
+                self.log("info", "No companies found. Scraping complete.")
+                return self.get_results()
 
+            self.log("info", f"Total potential companies: {len(all_companies)}. Looking up emails concurrently...")
+
+            semaphore = asyncio.Semaphore(8)
+            async def process_company(job: dict) -> Optional[dict]:
                 if not job["name"]:
-                    continue
+                    return None
 
                 dedup = self._dedup_key(job["name"], job["city"])
                 if dedup in self.seen_companies:
-                    self.log("info", f"Skipping duplicate: {job['name']}")
-                    continue
+                    return None
                 self.seen_companies.add(dedup)
 
                 email = job["email"]
 
-                if not email and job["website"] and website_lookups < max_website_lookups:
-                    website_lookups += 1
-                    self.log("info", f"No email on page for '{job['name']}', checking website... ({website_lookups}/{max_website_lookups})")
-                    async with httpx.AsyncClient(follow_redirects=True) as client:
-                        try:
-                            email = await asyncio.wait_for(
-                                find_email_on_company_website(
-                                    client, job["website"],
-                                    {"User-Agent": "Mozilla/5.0"}, log=self.log
-                                ),
-                                timeout=10.0,
-                            )
-                        except asyncio.TimeoutError:
-                            self.log("info", f"Website lookup timed out")
+                if not email and job["website"]:
+                    async with semaphore:
+                        email = await self._lookup_email(client, job["website"])
 
                 if not email:
                     self.log("info", f"DISCARDED '{job['name']}': no email found")
-                    continue
+                    return None
 
                 if self._is_already_extracted(email):
                     self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
-                    continue
+                    return None
 
                 self.log("info", f"KEPT '{job['name']}': email='{email}'")
 
-                self.companies.append({
+                return {
                     "company_name": job["name"],
                     "email": email,
                     "city": job["city"],
@@ -513,9 +500,19 @@ class AzubicaScraper(BaseScraper):
                     "job_title": job["title"] or self.profession,
                     "field": self.profession,
                     "source": "azubica",
-                })
+                }
 
-            self.log("info", f"Current companies with email: {len(self.companies)}")
+            tasks = [process_company(job) for job in all_companies[: self.max_results * 3]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    self.log("error", f"Task exception: {result}")
+                    continue
+                if result:
+                    self.companies.append(result)
+                    if len(self.companies) >= self.max_results:
+                        break
 
         self.log("info", "=== Azubica Scraping Complete ===")
         self.log("info", f"Total companies with email: {len(self.companies)}")

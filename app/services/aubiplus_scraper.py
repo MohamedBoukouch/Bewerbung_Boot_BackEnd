@@ -8,7 +8,7 @@ are DISCARDED.
 """
 import asyncio
 import re
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Dict, Any
 from urllib.parse import urljoin
 
 import httpx
@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 from app.services.scraper_base import BaseScraper
 from app.services.contact_finder import find_email_on_company_website, extract_emails_from_html
 
-POSTAL_CITY_RE = re.compile(r"\d{5}\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\-\. ]{1,40})")
+POSTAL_CITY_RE = re.compile(r"\b\d{5}\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\-\. ]{1,40})")
 
 
 class AubiPlusScraper(BaseScraper):
@@ -58,9 +58,6 @@ class AubiPlusScraper(BaseScraper):
             self.log("error", f"Fetch error for {url}: {str(e)}")
             return ""
 
-    # ---------------------------------------------------------------
-    # Search results parsing
-    # ---------------------------------------------------------------
     def _parse_job_links(self, html: str) -> List[str]:
         soup = BeautifulSoup(html, "html.parser")
         links = []
@@ -79,9 +76,6 @@ class AubiPlusScraper(BaseScraper):
             self.log("info", f"Found {len(links)} job links on this page.")
         return links
 
-    # ---------------------------------------------------------------
-    # Job detail parsing
-    # ---------------------------------------------------------------
     def _parse_detail(self, html: str, detail_url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
 
@@ -100,7 +94,7 @@ class AubiPlusScraper(BaseScraper):
 
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
-            m = re.search(r"bei\s+([A-ZÄÖÜ][\w&.\- ]{2,60})", full_text)
+            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.\- ]{2,60})", full_text)
             if m:
                 company_name = m.group(1).strip()
 
@@ -146,9 +140,58 @@ class AubiPlusScraper(BaseScraper):
             "email": direct_email,
         }
 
-    # ---------------------------------------------------------------
-    # Main scrape loop -- EMAIL IS MANDATORY
-    # ---------------------------------------------------------------
+    async def _process_job(self, client: httpx.AsyncClient, link: str) -> Optional[dict]:
+        detail_html = await self._fetch(client, link)
+        if not detail_html:
+            return None
+
+        job = self._parse_detail(detail_html, link)
+
+        if not job["name"]:
+            self.log("info", f"Skipping (no company name): {link}")
+            return None
+
+        dedup = self._dedup_key(job["name"], job["city"])
+        if dedup in self.seen_companies:
+            self.log("info", f"Skipping duplicate: {job['name']}")
+            return None
+        self.seen_companies.add(dedup)
+
+        email = job["email"]
+
+        if not email and job["website"]:
+            self.log("info", f"No email on offer for '{job['name']}', checking website {job['website']}...")
+            try:
+                email = await asyncio.wait_for(
+                    find_email_on_company_website(
+                        client, job["website"], self._headers(), log=self.log
+                    ),
+                    timeout=8.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("info", f"Website lookup timed out for '{job['name']}'")
+
+        if not email:
+            self.log("info", f"DISCARDED '{job['name']}': no email found (offer + website tried)")
+            return None
+
+        if self._is_already_extracted(email):
+            self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
+            return None
+
+        self.log("info", f"KEPT '{job['name']}': email='{email}' | city='{job['city']}'")
+
+        return {
+            "company_name": job["name"],
+            "email": email,
+            "city": job["city"],
+            "website": job["website"],
+            "phone": job["phone"],
+            "job_title": job["title"],
+            "field": self.profession,
+            "source": "aubiplus",
+        }
+
     async def scrape(self) -> List[dict]:
         self.log("info", "=== AubiPlus Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
@@ -159,83 +202,50 @@ class AubiPlusScraper(BaseScraper):
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
             max_pages = 5
+            all_links: List[str] = []
 
-            while len(self.companies) < self.max_results and page <= max_pages:
+            while len(all_links) < self.max_results * 2 and page <= max_pages:
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching AubiPlus page {page}: {url}")
                 html = await self._fetch(client, url)
                 if not html:
                     break
 
-                job_links = self._parse_job_links(html)
-                if not job_links:
+                links = self._parse_job_links(html)
+                if not links:
                     break
 
-                for link in job_links:
-                    if len(self.companies) >= self.max_results:
-                        break
+                all_links.extend(links)
 
-                    detail_html = await self._fetch(client, link)
-                    if not detail_html:
-                        continue
-
-                    job = self._parse_detail(detail_html, link)
-
-                    if not job["name"]:
-                        self.log("info", f"Skipping (no company name): {link}")
-                        continue
-
-                    dedup = self._dedup_key(job["name"], job["city"])
-                    if dedup in self.seen_companies:
-                        self.log("info", f"Skipping duplicate: {job['name']}")
-                        continue
-                    self.seen_companies.add(dedup)
-
-                    email = job["email"]
-
-                    # ── TRY WEBSITE IF NO EMAIL ON OFFER PAGE ──
-                    if not email and job["website"]:
-                        self.log("info", f"No email on offer for '{job['name']}', checking website {job['website']}...")
-                        try:
-                            email = await asyncio.wait_for(
-                                find_email_on_company_website(
-                                    client, job["website"], self._headers(), log=self.log
-                                ),
-                                timeout=15.0,
-                            )
-                        except asyncio.TimeoutError:
-                            self.log("info", f"Website lookup timed out for '{job['name']}'")
-
-                    # ── ONLY KEEP IF WE HAVE AN EMAIL ──
-                    if not email:
-                        self.log("info", f"DISCARDED '{job['name']}': no email found (offer + website tried)")
-                        continue
-
-                    if self._is_already_extracted(email):
-                        self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
-                        continue
-
-                    self.log("info", f"KEPT '{job['name']}': email='{email}' | city='{job['city']}'")
-
-                    self.companies.append({
-                        "company_name": job["name"],
-                        "email": email,
-                        "city": job["city"],
-                        "website": job["website"],
-                        "phone": job["phone"],
-                        "job_title": job["title"],
-                        "field": self.profession,
-                        "source": "aubiplus",
-                    })
-
-                self.log("info", f"Current companies with email: {len(self.companies)}")
-
-                if len(job_links) < 5:
+                if len(links) < 5:
                     self.log("info", "Fewer than 5 job links -- likely last page.")
                     break
 
                 page += 1
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.3)
+
+            if not all_links:
+                self.log("info", "No job links found. Scraping complete.")
+                return self.get_results()
+
+            self.log("info", f"Total job links found: {len(all_links)}. Fetching details concurrently...")
+
+            semaphore = asyncio.Semaphore(8)
+            async def limited_process(link: str) -> Optional[dict]:
+                async with semaphore:
+                    return await self._process_job(client, link)
+
+            tasks = [limited_process(link) for link in all_links[: self.max_results * 2]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    self.log("error", f"Task exception: {result}")
+                    continue
+                if result:
+                    self.companies.append(result)
+                    if len(self.companies) >= self.max_results:
+                        break
 
         self.log("info", "=== AubiPlus Scraping Complete ===")
         self.log("info", f"Total companies with email: {len(self.companies)}")

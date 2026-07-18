@@ -221,7 +221,7 @@ async def extract_data(payload: ExtractPayload):
             _sp(True, payload.source, "", "", 0, 0, "running")
         except Exception:
             pass
-        companies = await asyncio.wait_for(scraper.scrape(), timeout=50.0)
+        companies = await asyncio.wait_for(scraper.scrape(), timeout=90.0)
 
         add_log("success", f"Extraction complete! {len(companies)} companies with email found.")
 
