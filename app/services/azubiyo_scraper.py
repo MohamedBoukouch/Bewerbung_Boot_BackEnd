@@ -192,15 +192,23 @@ class AzubiyoScraper(BaseScraper):
         self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
 
         page = 1
-        max_pages = 3  # Limit pages to avoid long Selenium sessions
+        max_pages = 2  # Limit pages to avoid long Selenium sessions
+        max_details_per_page = 3
 
         while len(self.companies) < self.max_results and page <= max_pages:
             url = self._build_search_url(page)
             self.log("info", f"Fetching Azubiyo page {page} with Selenium: {url}")
             
             # Run Selenium in thread pool since it's blocking
-            loop = asyncio.get_event_loop()
-            html = await loop.run_in_executor(None, self._fetch_with_selenium, url)
+            loop = asyncio.get_running_loop()
+            try:
+                html = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._fetch_with_selenium, url),
+                    timeout=20.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("error", f"Timeout fetching Azubiyo page {page}")
+                break
             
             if not html:
                 break
@@ -209,13 +217,25 @@ class AzubiyoScraper(BaseScraper):
             if not job_links:
                 break
 
+            details_fetched = 0
             for link in job_links:
                 if len(self.companies) >= self.max_results:
                     break
 
+                # Limit Selenium detail fetches per page
+                if details_fetched >= max_details_per_page:
+                    self.log("info", f"Reached detail page limit ({max_details_per_page}) for page {page}")
+                    break
+                details_fetched += 1
+
                 # Fetch detail page with Selenium
-                detail_html = await loop.run_in_executor(None, self._fetch_with_selenium, link)
-                if not detail_html:
+                try:
+                    detail_html = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._fetch_with_selenium, link),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.log("info", f"Timeout fetching detail page: {link}")
                     continue
 
                 job = self._parse_detail(detail_html)
