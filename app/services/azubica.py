@@ -1,19 +1,14 @@
 """Azubica Scraper v2 - Scrapes regional Ausbildungsatlas pages
 
 Azubica.de is a regional Ausbildungsatlas platform (PDF magazine), NOT a searchable job board.
-Strategy: Scrape regional atlas pages for company listings, then find emails via company websites.
+Strategy: Try to search for jobs, scrape regional atlas pages for company listings,
+then find emails via company websites.
 """
 import asyncio
 import re
 import time
 from typing import List, Optional, Callable
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
 import httpx
 

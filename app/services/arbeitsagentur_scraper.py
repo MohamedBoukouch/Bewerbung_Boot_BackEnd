@@ -4,6 +4,7 @@ import base64
 import httpx
 from typing import List, Optional, Callable
 from app.services.scraper_base import BaseScraper
+from app.services.contact_finder import find_email_on_company_website
 
 API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service"
 API_KEY = "jobboerse-jobsuche"
@@ -186,7 +187,18 @@ class ArbeitsagenturScraper(BaseScraper):
 
         self.log("info", f"Company '{employer_name}': email='{email}'")
 
-        # _add_company will filter out if no email
+        if not email and employer_website:
+            self.log("info", f"No email in description for '{employer_name}', checking website {employer_website}...")
+            try:
+                email = await asyncio.wait_for(
+                    find_email_on_company_website(
+                        client, employer_website, self._headers(), log=self.log
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("info", f"Website lookup timed out for '{employer_name}'")
+
         self._add_company(employer_name, email, city, website, phone, job_title)
 
     async def scrape(self) -> List[dict]:

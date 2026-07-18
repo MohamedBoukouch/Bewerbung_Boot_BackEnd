@@ -67,14 +67,14 @@ class AubiPlusScraper(BaseScraper):
         seen = set()
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if "/ausbildung/" in href and href.rstrip("/") != "/ausbildung":
+            if any(seg in href for seg in ("/ausbildung/", "/stellenangebot/", "/ausbildungsplatz/", "/job/", "/stelle/")):
                 full = urljoin(self.BASE_URL, href)
-                if full not in seen:
+                if full not in seen and full != f"{self.BASE_URL}/":
                     seen.add(full)
                     links.append(full)
 
         if not links:
-            self.log("error", "No job links matching '/ausbildung/' found. Site markup may have changed.")
+            self.log("error", "No job links found. AubiPlus site markup may have changed.")
         else:
             self.log("info", f"Found {len(links)} job links on this page.")
         return links
