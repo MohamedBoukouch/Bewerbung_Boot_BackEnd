@@ -11,7 +11,8 @@ except Exception:
 
 class BaseScraper:
     def __init__(self, profession: str, location: str = "", max_results: int = 50,
-                 field_tags: List[str] = None, log_callback: Optional[Callable] = None):
+                 field_tags: List[str] = None, log_callback: Optional[Callable] = None,
+                 already_extracted_emails: List[str] = None):
         self.profession = profession
         self.location = location
         self.max_results = max_results
@@ -23,6 +24,7 @@ class BaseScraper:
         self.current_company = ""
         self.current_logo_url = ""
         self.pages_fetched = 0
+        self.already_extracted_emails = set(e.lower() for e in (already_extracted_emails or []) if e)
 
     def log(self, type_: str, message: str):
         if self.log_callback:
@@ -48,6 +50,11 @@ class BaseScraper:
 
     def _dedup_key(self, name: str, city: str) -> str:
         return f"{name.strip().lower()}|{city.strip().lower()}"
+
+    def _is_already_extracted(self, email: str) -> bool:
+        if not email or not self.already_extracted_emails:
+            return False
+        return email.lower() in self.already_extracted_emails
 
     def _favicon_url(self, website: str) -> str:
         """Best-effort: derive a favicon URL from the company website."""
@@ -103,7 +110,7 @@ class BaseScraper:
         self._progress()
 
     def _add_company(self, name: str, email: str, city: str, website: str, phone: str, job_title: str):
-        """Add company to results. ONLY if email is present."""
+        """Add company to results. ONLY if email is present and not already extracted."""
         name = name.strip()
         email = (email or "").strip()
 
@@ -114,6 +121,11 @@ class BaseScraper:
         # ✅ FILTER: Only keep companies WITH email
         if not email:
             self.log("info", f"Skipping '{name}': no email found")
+            return
+
+        # ✅ FILTER: Skip already extracted emails
+        if self._is_already_extracted(email):
+            self.log("info", f"Skipping '{name}': email '{email}' already extracted previously")
             return
 
         # Field tags as comma-separated string

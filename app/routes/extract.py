@@ -90,6 +90,7 @@ class ExtractPayload(BaseModel):
     config: ExtractConfig
     fieldTags: List[str]
     maxResults: int = 50
+    alreadyExtractedEmails: List[str] = []
 
 
 class ExtractResponse(BaseModel):
@@ -108,7 +109,7 @@ def _get_profession(config: ExtractConfig, fieldTags: List[str]) -> str:
     return profession
 
 
-def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[str], maxResults: int, add_log) -> Dict[str, Any]:
+def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[str], maxResults: int, add_log, already_extracted_emails: List[str] = None) -> Dict[str, Any]:
     """Build kwargs dynamically based on source type."""
     profession = _get_profession(config, fieldTags)
 
@@ -119,6 +120,9 @@ def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[st
         "field_tags": fieldTags,
         "log_callback": add_log,
     }
+
+    if already_extracted_emails:
+        kwargs["already_extracted_emails"] = already_extracted_emails
 
     if source in ("arbeitsagentur", "indeed", "linkedin", "xing"):
         kwargs["location_scope"] = config.locationScope or "Ganzer Ort"
@@ -196,6 +200,7 @@ async def extract_data(payload: ExtractPayload):
             fieldTags=payload.fieldTags,
             maxResults=payload.maxResults,
             add_log=add_log,
+            already_extracted_emails=payload.alreadyExtractedEmails or [],
         )
 
         # Filter kwargs to only include what the scraper accepts
@@ -207,6 +212,9 @@ async def extract_data(payload: ExtractPayload):
 
         scraper = ScraperClass(**filtered_kwargs)
         scraper.source_label = payload.source
+        scraper.already_extracted_emails = set(
+            e.lower() for e in (payload.alreadyExtractedEmails or []) if e
+        )
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(True, payload.source, "", "", 0, 0, "running")

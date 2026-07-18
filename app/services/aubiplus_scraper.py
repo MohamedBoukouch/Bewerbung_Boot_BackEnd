@@ -211,6 +211,10 @@ class AubiPlusScraper(BaseScraper):
                         self.log("info", f"DISCARDED '{job['name']}': no email found (offer + website tried)")
                         continue
 
+                    if self._is_already_extracted(email):
+                        self.log("info", f"SKIPPING '{job['name']}': email '{email}' already extracted previously")
+                        continue
+
                     self.log("info", f"KEPT '{job['name']}': email='{email}' | city='{job['city']}'")
 
                     self.companies.append({
