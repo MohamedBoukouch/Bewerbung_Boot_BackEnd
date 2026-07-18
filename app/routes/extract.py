@@ -165,6 +165,7 @@ async def extract_data(payload: ExtractPayload):
     add_log("info", f"Location: '{payload.config.location}'")
     add_log("info", f"Max Results: {payload.maxResults}")
     add_log("info", "Filter: Only companies with email will be kept")
+    add_log("info", "Will keep scraping until exact target is reached or no more results.")
 
     if payload.source not in SCRAPER_MAP:
         supported = ", ".join(SCRAPER_MAP.keys())
@@ -216,7 +217,7 @@ async def extract_data(payload: ExtractPayload):
         except Exception:
             pass
 
-        companies = await asyncio.wait_for(scraper.scrape(), timeout=300.0)
+        companies = await asyncio.wait_for(scraper.scrape(), timeout=600.0)  # 10 min timeout
 
         # STRICT LIMIT: Slice to exact maxResults requested
         if len(companies) > payload.maxResults:
@@ -240,7 +241,7 @@ async def extract_data(payload: ExtractPayload):
         )
 
     except asyncio.TimeoutError:
-        add_log("error", "Scrape timed out after 5 minutes.")
+        add_log("error", "Scrape timed out after 10 minutes.")
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(False, payload.source, "", "", 0, 0, "error")
@@ -251,7 +252,7 @@ async def extract_data(payload: ExtractPayload):
             companies=[],
             totalItems=0,
             logs=logs,
-            error="Scrape timed out after 5 minutes. Please try again or reduce the number of results."
+            error="Scrape timed out after 10 minutes. Please try again or reduce the number of results."
         )
 
     except Exception as e:

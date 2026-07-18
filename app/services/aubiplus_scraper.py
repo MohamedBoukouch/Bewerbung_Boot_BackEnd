@@ -1,10 +1,9 @@
 """
-AubiPlus Scraper - HTML scraping
+AubiPlus Scraper v2 - Fixed to reach exact target limit
 https://www.aubi-plus.de
 
-Email is MANDATORY. If no email on the offer page, visits the company
-website and extracts from Impressum/Kontakt. Companies without email
-are DISCARDED.
+Strategy: Process job links page by page, keep going until target_max reached.
+Email is MANDATORY. If no email on offer page, visits company website.
 """
 import asyncio
 import re
@@ -66,7 +65,7 @@ class AubiPlusScraper(BaseScraper):
             href = a["href"]
             if any(seg in href for seg in ("/ausbildung/", "/stellenangebot/", "/ausbildungsplatz/", "/job/", "/stelle/")):
                 full = urljoin(self.BASE_URL, href)
-                if full not in seen and full != f"{self.BASE_URL}/":
+                if full not in seen and full != f"{self.BASE_URL}/" and full.startswith(self.BASE_URL):
                     seen.add(full)
                     links.append(full)
 
@@ -85,13 +84,24 @@ class AubiPlusScraper(BaseScraper):
             title = h1.get_text(strip=True)
 
         company_name = ""
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/premium/" in href or "/unternehmen/" in href or "/firma/" in href:
-                company_name = a.get_text(strip=True)
+        # Try multiple selectors for company name
+        for sel in [".company-name", ".arbeitgeber", "[data-testid='company-name']", ".firmenname", ".unternehmen"]:
+            el = soup.select_one(sel)
+            if el:
+                company_name = el.get_text(strip=True)
                 if company_name:
                     break
 
+        # Fallback: look for links to company pages
+        if not company_name:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/premium/" in href or "/unternehmen/" in href or "/firma/" in href or "/arbeitgeber/" in href:
+                    company_name = a.get_text(strip=True)
+                    if company_name:
+                        break
+
+        # Fallback: regex from text
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
             m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.-\s]{2,60})", full_text)
@@ -117,7 +127,7 @@ class AubiPlusScraper(BaseScraper):
             if any(dom in href for dom in excluded_domains):
                 continue
             link_text = a.get_text(strip=True).lower()
-            if "website" in link_text or "webseite" in link_text or "homepage" in link_text:
+            if "website" in link_text or "webseite" in link_text or "homepage" in link_text or "zur webseite" in link_text:
                 company_website = href
                 break
         if not company_website:
@@ -140,20 +150,20 @@ class AubiPlusScraper(BaseScraper):
             "email": direct_email,
         }
 
-    async def _process_job(self, client: httpx.AsyncClient, link: str) -> Optional[dict]:
-        # HARD STOP check
+    async def _process_job(self, client: httpx.AsyncClient, link: str) -> bool:
+        """Process a single job link. Returns True if company was added."""
         if self._should_stop():
-            return None
+            return False
 
         detail_html = await self._fetch(client, link)
         if not detail_html:
-            return None
+            return False
 
         job = self._parse_detail(detail_html, link)
 
         if not job["name"]:
             self.log("info", f"Skipping (no company name): {link}")
-            return None
+            return False
 
         self._set_current(job["name"], job["website"])
 
@@ -173,63 +183,72 @@ class AubiPlusScraper(BaseScraper):
 
         if not email:
             self.log("info", f"DISCARDED '{job['name']}': no email found (offer + website tried)")
-            return None
+            return False
 
         self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
-        return {"done": True}
+        return True
 
     async def scrape(self) -> List[dict]:
         self.log("info", "=== AubiPlus Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
+        self.log("info", f"Target: {self.target_max} companies with email")
         self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
+        self.log("info", "Will keep fetching pages until target is reached or no more results.")
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
-            max_pages = 5
-            all_links: List[str] = []
+            max_pages = 20  # Increased - keep going until we hit target or run out
+            consecutive_empty = 0
+            max_consecutive_empty = 3
 
-            while len(all_links) < self.target_max * 3 and page <= max_pages:
-                # HARD STOP check
-                if self._should_stop():
-                    break
-
+            while not self._should_stop() and page <= max_pages and consecutive_empty < max_consecutive_empty:
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching AubiPlus page {page}: {url}")
+                self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
+
                 html = await self._fetch(client, url)
                 if not html:
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
 
                 links = self._parse_job_links(html)
                 if not links:
-                    break
+                    self.log("info", "No job links on this page. Likely last page.")
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                else:
+                    consecutive_empty = 0
 
-                all_links.extend(links)
+                self.log("info", f"Processing {len(links)} job links from page {page}...")
 
-                if len(links) < 5:
-                    self.log("info", "Fewer than 5 job links -- likely last page.")
-                    break
+                # Process each link sequentially (safer for rate limiting)
+                for link in links:
+                    if self._should_stop():
+                        self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
+                        break
+
+                    await self._process_job(client, link)
+
+                    # Small delay between requests
+                    await asyncio.sleep(0.2)
+
+                self.log("info", f"After page {page}: {len(self.companies)}/{self.target_max} companies")
+
+                # Check if we got fewer links than expected (last page indicator)
+                if len(links) < 10:
+                    self.log("info", f"Fewer than 10 job links ({len(links)}) -- likely last page, but will check next.")
 
                 page += 1
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
 
-            if not all_links:
-                self.log("info", "No job links found. Scraping complete.")
-                return self.get_results()
-
-            self.log("info", f"Total job links found: {len(all_links)}. Fetching details concurrently...")
-
-            semaphore = asyncio.Semaphore(8)
-            async def limited_process(link: str) -> Optional[dict]:
-                async with semaphore:
-                    if self._should_stop():
-                        return None
-                    return await self._process_job(client, link)
-
-            tasks = [limited_process(link) for link in all_links[:self.target_max * 3]]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if page > max_pages:
+                self.log("info", f"Max page limit ({max_pages}) reached.")
+            if consecutive_empty >= max_consecutive_empty:
+                self.log("info", f"Stopped after {max_consecutive_empty} consecutive empty pages.")
 
         self.log("info", "=== AubiPlus Scraping Complete ===")
-        self.log("info", f"Total companies with email: {len(self.companies)}")
+        self.log("info", f"Total companies with email: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

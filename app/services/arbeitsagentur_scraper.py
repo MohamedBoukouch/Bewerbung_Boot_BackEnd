@@ -204,39 +204,40 @@ class ArbeitsagenturScraper(BaseScraper):
         self.log("info", "=== Arbeitsagentur Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
-        self.log("info", "Note: Only companies WITH email will be kept")
+        self.log("info", f"Target: {self.target_max} companies with email")
+        self.log("info", "Will keep fetching pages until target is reached or no more results.")
         self._progress()
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
             total_fetched = 0
-            max_pages = 10  # Increased to find enough emails
+            max_pages = 20  # Increased to find enough emails
+            consecutive_empty = 0
 
-            while total_fetched < self.target_max and page <= max_pages:
-                # HARD STOP check before fetching next page
-                if self._should_stop():
-                    self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
-                    break
-
+            while not self._should_stop() and page <= max_pages and consecutive_empty < 3:
                 jobs = await self._search_jobs(client, page=page)
                 self.pages_fetched = page
 
                 if not jobs:
                     self.log("info", "No jobs returned from API.")
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                else:
+                    consecutive_empty = 0
 
                 self.log("info", f"Processing {len(jobs)} jobs from page {page}...")
+                self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
 
                 # Process jobs sequentially
                 for job in jobs:
                     if self._should_stop():
-                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
+                        self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
                         break
                     await self._process_job(client, job)
                     total_fetched = len(self.companies)
 
-                self.log("info", f"Current companies with email: {total_fetched}")
+                self.log("info", f"After page {page}: {len(self.companies)}/{self.target_max} companies")
 
                 if len(jobs) < 25:
                     self.log("info", f"Last page reached ({len(jobs)} < 25).")
@@ -249,5 +250,5 @@ class ArbeitsagenturScraper(BaseScraper):
                 self.log("info", f"Max page limit ({max_pages}) reached.")
 
         self.log("info", "=== Scraping Complete ===")
-        self.log("info", f"Total unique companies with email: {len(self.companies)}")
+        self.log("info", f"Total companies with email: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

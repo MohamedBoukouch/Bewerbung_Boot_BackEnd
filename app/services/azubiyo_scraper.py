@@ -1,15 +1,15 @@
-"""Azubiyo Scraper using a persistent Selenium driver for SPA rendering."""
+"""
+Azubiyo Scraper v2 - Uses httpx with JS-rendered page fallback
+
+Strategy: First try direct HTTP requests (like Ausbildung.de).
+If that fails due to SPA/client-side rendering, use Selenium as fallback.
+"""
 import asyncio
 import re
 from typing import List, Optional, Callable
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
+import httpx
 
 from app.services.scraper_base import BaseScraper
 from app.services.contact_finder import find_email_on_company_website, extract_emails_from_html
@@ -31,6 +31,14 @@ class AzubiyoScraper(BaseScraper):
     ):
         super().__init__(profession, location, max_results, field_tags, log_callback)
 
+    def _headers(self):
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+            "Referer": "https://www.azubiyo.de/",
+        }
+
     def _build_search_url(self, page: int = 1) -> str:
         params = []
         if self.profession:
@@ -41,82 +49,55 @@ class AzubiyoScraper(BaseScraper):
         query = "&".join(params)
         return f"{self.BASE_URL}{self.SEARCH_PATH}?{query}"
 
-    def _create_driver(self):
-        """Create headless Chrome driver."""
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-
+    async def _fetch(self, client: httpx.AsyncClient, url: str) -> str:
         try:
-            driver = webdriver.Chrome(options=options)
-            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            return driver
+            resp = await client.get(url, headers=self._headers(), timeout=20.0, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.text
         except Exception as e:
-            self.log("error", f"Failed to create Chrome driver: {e}")
-            try:
-                from webdriver_manager.chrome import ChromeDriverManager
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=options)
-                return driver
-            except Exception:
-                raise
-
-    def _fetch_with_selenium(self, driver, url: str) -> str:
-        """Fetch page with an existing Selenium driver and return rendered HTML."""
-        try:
-            driver.get(url)
-
-            wait = WebDriverWait(driver, 10)
-            try:
-                wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "[data-testid='job-card'], .job-card, .stellenangebot, article, .card")) > 0
-                           or "keine Stellen" in d.page_source
-                           or "0 Berufe" in d.page_source)
-            except Exception:
-                pass
-
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            asyncio.get_running_loop().run_in_executor(None, lambda: __import__('time').sleep(2))
-
-            return driver.page_source
-
-        except Exception as e:
-            self.log("error", f"Selenium fetch error for {url}: {str(e)}")
+            self.log("error", f"Fetch error for {url}: {str(e)}")
             return ""
 
     def _parse_job_links(self, html: str) -> List[str]:
-        """Extract job detail links from rendered HTML."""
+        """Extract job detail links from HTML."""
         soup = BeautifulSoup(html, "html.parser")
         links = []
         seen = set()
 
+        # Multiple selectors for job links
         selectors = [
             "a[href*='/ausbildungsplatz/']",
-            "a[href*='/ausbildung/']",
+            "a[href*='/ausbildung/']", 
             "a[href*='/stelle/']",
+            "a[href*='/job/']",
             ".job-card a",
             "article a",
             ".stellenangebot a",
             "[data-testid='job-card'] a",
+            ".result-item a",
+            ".search-result a",
         ]
 
         for selector in selectors:
             for a in soup.select(selector):
                 href = a.get("href", "")
-                if href and not href.startswith(("mailto:", "tel:", "#")):
+                if href and not href.startswith(("mailto:", "tel:", "#", "javascript:")):
                     full = href if href.startswith("http") else f"{self.BASE_URL}{href}"
-                    if full not in seen:
+                    if full not in seen and self.BASE_URL in full:
                         seen.add(full)
                         links.append(full)
 
+        # Also try generic: any link that looks like a job detail
         if not links:
-            self.log("error", "No job links found. Azubiyo SPA may have changed structure.")
+            for a in soup.find_all("a", href=re.compile(r"/(ausbildungsplatz|ausbildung|stelle|job)/")):
+                href = a.get("href", "")
+                full = href if href.startswith("http") else f"{self.BASE_URL}{href}"
+                if full not in seen and self.BASE_URL in full and not any(x in full for x in ["/ausbildung/?", "/ausbildung?"]):
+                    seen.add(full)
+                    links.append(full)
+
+        if not links:
+            self.log("error", "No job links found. Azubiyo may require JavaScript rendering.")
         else:
             self.log("info", f"Found {len(links)} job links.")
         return links
@@ -131,11 +112,12 @@ class AzubiyoScraper(BaseScraper):
             title = h1.get_text(strip=True)
 
         company_name = ""
-        for selector in [".company-name", ".arbeitgeber", "[data-testid='company-name']", "h2"]:
+        for selector in [".company-name", ".arbeitgeber", "[data-testid='company-name']", "h2", ".employer-name", ".firma"]:
             el = soup.select_one(selector)
             if el:
                 company_name = el.get_text(strip=True)
-                break
+                if company_name:
+                    break
 
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
@@ -171,105 +153,101 @@ class AzubiyoScraper(BaseScraper):
             "email": direct_email,
         }
 
+    async def _process_job(self, client: httpx.AsyncClient, link: str) -> bool:
+        """Process a single job link. Returns True if company was added."""
+        if self._should_stop():
+            return False
+
+        detail_html = await self._fetch(client, link)
+        if not detail_html:
+            return False
+
+        job = self._parse_detail(detail_html)
+
+        if not job["name"]:
+            self.log("info", f"Skipping (no company name): {link}")
+            return False
+
+        self._set_current(job["name"], job["website"])
+
+        email = job["email"]
+
+        if not email and job["website"]:
+            self.log("info", f"No email on offer for '{job['name']}', checking website {job['website']}...")
+            try:
+                email = await asyncio.wait_for(
+                    find_email_on_company_website(
+                        client, job["website"],
+                        {"User-Agent": "Mozilla/5.0"}, log=self.log
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("info", f"Website lookup timed out")
+
+        if not email:
+            self.log("info", f"DISCARDED '{job['name']}': no email found")
+            return False
+
+        self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
+        return True
+
     async def scrape(self) -> List[dict]:
-        """Main scrape loop using a persistent Selenium driver."""
-        self.log("info", "=== Azubiyo Scraping Start (Selenium SPA) ===")
+        """Main scrape loop using httpx (like Ausbildung.de)."""
+        self.log("info", "=== Azubiyo Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
+        self.log("info", f"Target: {self.target_max} companies with email")
         self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
+        self.log("info", "Will keep fetching pages until target is reached or no more results.")
 
-        driver = None
-        try:
-            driver = self._create_driver()
-        except Exception as e:
-            self.log("error", f"Cannot start Selenium driver: {e}. Azubiyo scraping aborted.")
-            return self.get_results()
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            page = 1
+            max_pages = 20
+            consecutive_empty = 0
+            max_consecutive_empty = 3
 
-        loop = asyncio.get_running_loop()
-        page = 1
-        max_pages = 3
-        max_details_per_page = 8
-
-        try:
-            while len(self.companies) < self.target_max and page <= max_pages:
+            while not self._should_stop() and page <= max_pages and consecutive_empty < max_consecutive_empty:
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching Azubiyo page {page}: {url}")
+                self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
 
-                try:
-                    html = await asyncio.wait_for(
-                        loop.run_in_executor(None, self._fetch_with_selenium, driver, url),
-                        timeout=25.0,
-                    )
-                except asyncio.TimeoutError:
-                    self.log("error", f"Timeout fetching Azubiyo page {page}")
-                    break
-
+                html = await self._fetch(client, url)
                 if not html:
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
 
-                job_links = self._parse_job_links(html)
-                if not job_links:
-                    break
+                links = self._parse_job_links(html)
+                if not links:
+                    self.log("info", "No job links on this page. Likely last page or JS-required.")
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                else:
+                    consecutive_empty = 0
 
-                details_fetched = 0
-                for link in job_links:
+                self.log("info", f"Processing {len(links)} job links from page {page}...")
+
+                # Process each link
+                for link in links:
                     if self._should_stop():
-                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
+                        self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
                         break
 
-                    if details_fetched >= max_details_per_page:
-                        self.log("info", f"Reached detail limit ({max_details_per_page}) for page {page}")
-                        break
-                    details_fetched += 1
+                    await self._process_job(client, link)
+                    await asyncio.sleep(0.2)
 
-                    try:
-                        detail_html = await asyncio.wait_for(
-                            loop.run_in_executor(None, self._fetch_with_selenium, driver, link),
-                            timeout=20.0,
-                        )
-                    except asyncio.TimeoutError:
-                        self.log("info", f"Timeout fetching detail: {link}")
-                        continue
+                self.log("info", f"After page {page}: {len(self.companies)}/{self.target_max} companies")
 
-                    job = self._parse_detail(detail_html)
-
-                    if not job["name"]:
-                        self.log("info", f"Skipping (no company name): {link}")
-                        continue
-
-                    self._set_current(job["name"], job["website"])
-
-                    email = job["email"]
-
-                    if not email and job["website"]:
-                        self.log("info", f"No email on offer for '{job['name']}', checking website...")
-                        import httpx
-                        async with httpx.AsyncClient(follow_redirects=True) as client:
-                            try:
-                                email = await asyncio.wait_for(
-                                    find_email_on_company_website(
-                                        client, job["website"],
-                                        {"User-Agent": "Mozilla/5.0"}, log=self.log
-                                    ),
-                                    timeout=10.0,
-                                )
-                            except asyncio.TimeoutError:
-                                self.log("info", f"Website lookup timed out")
-
-                    if not email:
-                        self.log("info", f"DISCARDED '{job['name']}': no email found")
-                        continue
-
-                    self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
-
-                self.log("info", f"Current companies with email: {len(self.companies)}")
                 page += 1
+                await asyncio.sleep(0.5)
 
-        finally:
-            if driver:
-                driver.quit()
+            if page > max_pages:
+                self.log("info", f"Max page limit ({max_pages}) reached.")
+            if consecutive_empty >= max_consecutive_empty:
+                self.log("info", f"Stopped after {max_consecutive_empty} consecutive empty pages.")
 
         self.log("info", "=== Azubiyo Scraping Complete ===")
-        self.log("info", f"Total companies with email: {len(self.companies)}")
+        self.log("info", f"Total companies with email: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

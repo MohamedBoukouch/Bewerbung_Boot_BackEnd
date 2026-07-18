@@ -125,19 +125,19 @@ class LinkedInScraper(BaseScraper):
             "email": direct_email,
         }
 
-    async def _process_job(self, client: httpx.AsyncClient, link: str) -> Optional[dict]:
+    async def _process_job(self, client: httpx.AsyncClient, link: str) -> bool:
         if self._should_stop():
-            return None
+            return False
 
         detail_html = await self._fetch(client, link)
         if not detail_html:
-            return None
+            return False
 
         job = self._parse_detail(detail_html)
 
         if not job["name"]:
             self.log("info", f"Skipping (no company name): {link}")
-            return None
+            return False
 
         self._set_current(job["name"], job["website"])
 
@@ -157,54 +157,65 @@ class LinkedInScraper(BaseScraper):
 
         if not email:
             self.log("info", f"DISCARDED '{job['name']}': no email found")
-            return None
+            return False
 
         self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"])
-        return {"done": True}
+        return True
 
     async def scrape(self) -> List[dict]:
         self.log("info", "=== LinkedIn Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
+        self.log("info", f"Target: {self.target_max} companies with email")
         self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
         self.log("info", "WARNING: LinkedIn often blocks scrapers. Results may be limited.")
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
-            max_pages = 3  # LinkedIn is more aggressive with blocking
+            max_pages = 5
+            consecutive_empty = 0
 
-            while page <= max_pages:
-                if self._should_stop():
-                    break
-
+            while not self._should_stop() and page <= max_pages and consecutive_empty < 3:
                 url = self._build_search_url(page)
                 self.log("info", f"Fetching LinkedIn page {page}: {url}")
+                self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
+
                 html = await self._fetch(client, url)
                 if not html:
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
 
                 links = self._parse_job_links(html)
                 if not links:
-                    break
+                    self.log("info", "No job links on this page. Likely blocked or last page.")
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                else:
+                    consecutive_empty = 0
 
-                semaphore = asyncio.Semaphore(4)  # Lower concurrency for LinkedIn
-                async def limited_process(link: str) -> Optional[dict]:
-                    async with semaphore:
-                        if self._should_stop():
-                            return None
-                        return await self._process_job(client, link)
+                self.log("info", f"Processing {len(links)} job links from page {page}...")
 
-                tasks = [limited_process(link) for link in links[:self.target_max]]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                for link in links:
+                    if self._should_stop():
+                        self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
+                        break
+
+                    await self._process_job(client, link)
+                    await asyncio.sleep(0.3)
+
+                self.log("info", f"After page {page}: {len(self.companies)}/{self.target_max} companies")
 
                 if len(links) < 25:
-                    self.log("info", "Fewer than 25 job links -- likely last page.")
                     break
 
                 page += 1
-                await asyncio.sleep(1.0)  # Slower for LinkedIn
+                await asyncio.sleep(1.0)
+
+            if page > max_pages:
+                self.log("info", f"Max page limit ({max_pages}) reached.")
 
         self.log("info", "=== LinkedIn Scraping Complete ===")
-        self.log("info", f"Total companies with email: {len(self.companies)}")
+        self.log("info", f"Total companies with email: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

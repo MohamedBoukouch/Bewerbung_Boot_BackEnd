@@ -1,7 +1,8 @@
-"""Azubica Scraper v2 - Scrapes regional Ausbildungsatlas pages
+"""
+Azubica Scraper v3 - Fixed to reach exact target limit
 
-Azubica.de is a regional Ausbildungsatlas platform (PDF magazine), NOT a searchable job board.
-Strategy: Scrape regional atlas pages for company listings, then find emails via company websites.
+Azubica.de is a regional Ausbildungsatlas platform.
+Strategy: Scrape regional atlas pages, then find emails via company websites.
 """
 import asyncio
 import re
@@ -293,6 +294,7 @@ class AzubicaScraper(BaseScraper):
                 slug = self.REGION_MAP[loc]
                 urls.append(f"{self.BASE_URL}/{slug}/")
             else:
+                # Try partial match
                 for key, slug in self.REGION_MAP.items():
                     if loc in key or key in loc:
                         urls.append(f"{self.BASE_URL}/{slug}/")
@@ -311,6 +313,7 @@ class AzubicaScraper(BaseScraper):
         soup = BeautifulSoup(html, "html.parser")
         companies = []
 
+        # Try multiple selectors
         selectors = [
             ".company", ".company-item", ".employer", ".employer-item",
             ".ausbildungsbetrieb", ".betrieb", ".firmen-entry",
@@ -330,6 +333,7 @@ class AzubicaScraper(BaseScraper):
                 if companies:
                     break
 
+        # Fallback: extract from all links
         if not companies:
             self.log("info", "No structured data found, trying link extraction...")
             companies = self._extract_companies_from_links(soup)
@@ -350,7 +354,7 @@ class AzubicaScraper(BaseScraper):
 
         if not name:
             text = el.get_text(" ", strip=True) if hasattr(el, 'get_text') else ""
-            name = text.split("\n")[0][:100]
+            name = text.split("\n")[0][:100] if text else ""
 
         for a in el.find_all("a", href=True) if hasattr(el, 'find_all') else []:
             href = a["href"]
@@ -429,9 +433,9 @@ class AzubicaScraper(BaseScraper):
         self.log("info", "=== Azubica Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
+        self.log("info", f"Target: {self.target_max} companies with email")
         self.log("info", "Email is REQUIRED. Offers without email are DISCARDED.")
-        self.log("info", "NOTE: Azubica is a regional Ausbildungsatlas (PDF magazine), not a job board.")
+        self.log("info", "NOTE: Azubica is a regional Ausbildungsatlas. Results depend on location.")
 
         atlas_urls = self._get_atlas_urls()
         self.log("info", f"Will scrape {len(atlas_urls)} atlas page(s): {atlas_urls}")
@@ -440,7 +444,6 @@ class AzubicaScraper(BaseScraper):
             all_companies: List[dict] = []
 
             for url in atlas_urls:
-                # HARD STOP check
                 if self._should_stop():
                     break
 
@@ -467,35 +470,34 @@ class AzubicaScraper(BaseScraper):
                 self.log("info", "No companies found. Scraping complete.")
                 return self.get_results()
 
-            self.log("info", f"Total potential companies: {len(all_companies)}. Looking up emails concurrently...")
+            self.log("info", f"Total potential companies: {len(all_companies)}. Looking up emails...")
+            self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
 
-            semaphore = asyncio.Semaphore(8)
-            async def process_company(job: dict) -> Optional[dict]:
+            # Process companies one by one
+            for job in all_companies:
                 if self._should_stop():
-                    return None
+                    self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
+                    break
 
                 if not job["name"]:
-                    return None
+                    continue
+
+                self._set_current(job["name"], job["website"])
 
                 email = job["email"]
 
                 if not email and job["website"]:
-                    async with semaphore:
-                        if self._should_stop():
-                            return None
-                        email = await self._lookup_email(client, job["website"])
+                    email = await self._lookup_email(client, job["website"])
 
                 if not email:
                     self.log("info", f"DISCARDED '{job['name']}': no email found")
-                    return None
+                    continue
 
-                self._set_current(job["name"], job["website"])
                 self._add_company(job["name"], email, job["city"], job["website"], job["phone"], job["title"] or self.profession)
-                return {"done": True}
+                self.log("info", f"Progress: {len(self.companies)}/{self.target_max} companies")
 
-            tasks = [process_company(job) for job in all_companies[:self.target_max * 3]]
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(0.1)
 
         self.log("info", "=== Azubica Scraping Complete ===")
-        self.log("info", f"Total companies with email: {len(self.companies)}")
+        self.log("info", f"Total companies with email: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

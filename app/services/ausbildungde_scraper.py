@@ -64,7 +64,7 @@ class AusbildungDeScraper(BaseScraper):
             cards = soup.find_all("div", class_=lambda x: x and ("job" in x.lower() or "card" in x.lower() or "result" in x.lower() or "stelle" in x.lower() or "platz" in x.lower()))
             self.log("info", f"Fallback: found {len(cards)} potential cards")
 
-        for card in cards[:self.target_max]:  # Use target_max instead of max_results
+        for card in cards[:self.target_max]:  # Use target_max for exact limit
             job = self._parse_card(card)
             if job:
                 jobs.append(job)
@@ -123,29 +123,36 @@ class AusbildungDeScraper(BaseScraper):
         self.log("info", "=== Ausbildung.de Scraping Start ===")
         self.log("info", f"Profession: '{self.profession}'")
         self.log("info", f"Location: '{self.location or 'Germany-wide'}'")
-        self.log("info", f"Max results: {self.max_results}")
+        self.log("info", f"Target: {self.target_max} companies with email")
+        self.log("info", "Will keep fetching pages until target is reached or no more results.")
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             page = 1
-            while len(self.companies) < self.target_max:  # Use target_max for exact limit
-                if self._should_stop():
-                    self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
-                    break
+            max_pages = 20
+            consecutive_empty = 0
 
+            while not self._should_stop() and page <= max_pages and consecutive_empty < 3:
+                self.log("info", f"Current progress: {len(self.companies)}/{self.target_max} companies")
                 html = await self._fetch_page(client, page)
                 if not html:
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
 
                 jobs = self._parse_jobs(html)
                 if not jobs:
                     self.log("info", "No jobs found on this page.")
-                    break
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                else:
+                    consecutive_empty = 0
 
                 self.log("info", f"Processing {len(jobs)} jobs from page {page}...")
 
                 for job in jobs:
                     if self._should_stop():
-                        self.log("info", f"Reached exact target limit ({self.target_max}). Stopping.")
+                        self.log("info", f"Reached target limit ({self.target_max}). Stopping.")
                         break
 
                     if job.get("link"):
@@ -173,6 +180,9 @@ class AusbildungDeScraper(BaseScraper):
                 page += 1
                 await asyncio.sleep(1.0)
 
+            if page > max_pages:
+                self.log("info", f"Max page limit ({max_pages}) reached.")
+
         self.log("info", "=== Ausbildung.de Scraping Complete ===")
-        self.log("info", f"Total companies: {len(self.companies)}")
+        self.log("info", f"Total companies: {len(self.companies)} (target was {self.target_max})")
         return self.get_results()

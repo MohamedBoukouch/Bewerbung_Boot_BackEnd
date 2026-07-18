@@ -70,10 +70,13 @@ class BaseScraper:
         for m in matches:
             m_lower = m.lower()
             # Skip common image/template placeholders
-            if any(bad in m_lower for bad in ['example.com', 'domain.com', 'yourdomain', 'test.com', 'sample.com']):
+            if any(bad in m_lower for bad in ['example.com', 'domain.com', 'yourdomain', 'test.com', 'sample.com', 'email@', 'mail@', 'info@example']):
                 continue
             # Skip overly long emails (likely not real)
             if len(m) > 60:
+                continue
+            # Skip emails with no dots before @ (usually invalid)
+            if '.' not in m.split('@')[0] and len(m.split('@')[0]) < 3:
                 continue
             valid.append(m)
         return valid[0] if valid else ""
@@ -150,7 +153,7 @@ class BaseScraper:
         field = ", ".join(self.field_tags) if self.field_tags else self.profession
 
         company = {
-            "company_name": name,  # Consistent key name
+            "company_name": name,  # Consistent key name for frontend
             "name": name,
             "email": email,
             "city": city or "",
@@ -164,7 +167,7 @@ class BaseScraper:
         }
 
         self.companies.append(company)
-        self.log("success", f"Added company: {name} ({email})")
+        self.log("success", f"Added company: {name} ({email}) [{len(self.companies)}/{self.target_max}]")
         self._progress()
 
     def get_results(self) -> List[dict]:
