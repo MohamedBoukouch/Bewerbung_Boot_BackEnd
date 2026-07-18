@@ -121,7 +121,7 @@ class AzubiyoScraper(BaseScraper):
 
         if not company_name:
             full_text = soup.get_text(" ", strip=True)
-            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.-\s]{2,60})", full_text)
+            m = re.search(r"\bbei\s+([A-ZÄÖÜ][\w&.\s-]{2,60})", full_text)
             if m:
                 company_name = m.group(1).strip()
 
