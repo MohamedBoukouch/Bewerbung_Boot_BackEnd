@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+import asyncio
 import inspect
 
 from app.services.extract_progress import reset, stream_generator
@@ -220,7 +221,7 @@ async def extract_data(payload: ExtractPayload):
             _sp(True, payload.source, "", "", 0, 0, "running")
         except Exception:
             pass
-        companies = await scraper.scrape()
+        companies = await asyncio.wait_for(scraper.scrape(), timeout=50.0)
 
         add_log("success", f"Extraction complete! {len(companies)} companies with email found.")
 
@@ -236,6 +237,21 @@ async def extract_data(payload: ExtractPayload):
             companies=companies,
             totalItems=len(companies),
             logs=logs,
+        )
+
+    except asyncio.TimeoutError:
+        add_log("error", "Scrape timed out after 50 seconds.")
+        try:
+            from app.services.extract_progress import set_progress as _sp
+            _sp(False, payload.source, "", "", 0, 0, "error")
+        except Exception:
+            pass
+        return ExtractResponse(
+            success=False,
+            companies=[],
+            totalItems=0,
+            logs=logs,
+            error="Scrape timed out after 50 seconds. Please try again or reduce the number of results."
         )
 
     except Exception as e:

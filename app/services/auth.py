@@ -4,7 +4,9 @@ from typing import Optional
 from jose import jwt, JWTError
 from fastapi import Request
 
-SECRET_KEY = os.environ["SESSION_SECRET_KEY"]
+SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", "")
+if not SECRET_KEY:
+    raise RuntimeError("SESSION_SECRET_KEY is not configured")
 ALGORITHM = "HS256"
 COOKIE_NAME = "bb_session"
 

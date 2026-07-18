@@ -5,6 +5,7 @@ Strategy: Scrape regional atlas pages for company listings, then find emails via
 """
 import asyncio
 import re
+import time
 from typing import List, Optional, Callable
 
 from selenium import webdriver
@@ -307,6 +308,7 @@ class AzubicaScraper(BaseScraper):
         driver = None
         try:
             driver = self._create_driver()
+            driver.set_page_load_timeout(20)
             driver.get(url)
 
             wait = WebDriverWait(driver, 15)
@@ -316,7 +318,7 @@ class AzubicaScraper(BaseScraper):
                 pass
 
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            asyncio.run(asyncio.sleep(2))
+            time.sleep(2)
 
             return driver.page_source
 
@@ -476,14 +478,24 @@ class AzubicaScraper(BaseScraper):
         atlas_urls = self._get_atlas_urls()
         self.log("info", f"Will scrape {len(atlas_urls)} atlas page(s): {atlas_urls}")
 
+        max_website_lookups = 5
+        website_lookups = 0
+
         for url in atlas_urls:
             if len(self.companies) >= self.max_results:
                 break
 
             self.log("info", f"Fetching Azubica atlas: {url}")
 
-            loop = asyncio.get_event_loop()
-            html = await loop.run_in_executor(None, self._fetch_with_selenium, url)
+            loop = asyncio.get_running_loop()
+            try:
+                html = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._fetch_with_selenium, url),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                self.log("error", f"Timeout fetching {url}")
+                continue
 
             if not html:
                 self.log("error", f"Failed to fetch {url}")
@@ -507,17 +519,17 @@ class AzubicaScraper(BaseScraper):
 
                 email = job["email"]
 
-                # Try website if no email on page
-                if not email and job["website"]:
-                    self.log("info", f"No email on page for '{job['name']}', checking website...")
+                if not email and job["website"] and website_lookups < max_website_lookups:
+                    website_lookups += 1
+                    self.log("info", f"No email on page for '{job['name']}', checking website... ({website_lookups}/{max_website_lookups})")
                     async with httpx.AsyncClient(follow_redirects=True) as client:
                         try:
                             email = await asyncio.wait_for(
                                 find_email_on_company_website(
-                                    client, job["website"], 
+                                    client, job["website"],
                                     {"User-Agent": "Mozilla/5.0"}, log=self.log
                                 ),
-                                timeout=15.0,
+                                timeout=10.0,
                             )
                         except asyncio.TimeoutError:
                             self.log("info", f"Website lookup timed out")
