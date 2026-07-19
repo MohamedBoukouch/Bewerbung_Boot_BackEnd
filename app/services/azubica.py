@@ -1,8 +1,8 @@
 """
-Azubica Scraper v3 - Fixed to reach exact target limit
+Azubica Scraper v4 - Robust multi-strategy extraction
 
 Azubica.de is a regional Ausbildungsatlas platform.
-Strategy: Scrape regional atlas pages, then find emails via company websites.
+Strategy: Multiple parsing strategies with aggressive fallbacks.
 """
 import asyncio
 import re
@@ -15,6 +15,20 @@ from app.services.scraper_base import BaseScraper
 from app.services.contact_finder import find_email_on_company_website, extract_emails_from_html
 
 POSTAL_CITY_RE = re.compile(r"\b\d{5}\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\-\. ]{1,40})")
+
+# Patterns that suggest a block of text contains company info
+COMPANY_HINT_RE = re.compile(
+    r"(ausbildung|azubi|stelle|job|karriere|beruf|firma|unternehmen|betrieb|arbeitgeber)",
+    re.IGNORECASE,
+)
+
+# Domains to exclude when extracting company websites
+EXCLUDED_DOMAINS = (
+    "azubica.de", "facebook.com", "instagram.com", "linkedin.com",
+    "tiktok.com", "youtube.com", "twitter.com", "x.com", "google.com",
+    "bing.com", "yahoo.com", "wikipedia.org", "amazon.", "ebay.",
+    "googleusercontent.com", "schema.org", "w3.org",
+)
 
 
 class AzubicaScraper(BaseScraper):
@@ -294,7 +308,6 @@ class AzubicaScraper(BaseScraper):
                 slug = self.REGION_MAP[loc]
                 urls.append(f"{self.BASE_URL}/{slug}/")
             else:
-                # Try partial match
                 for key, slug in self.REGION_MAP.items():
                     if loc in key or key in loc:
                         urls.append(f"{self.BASE_URL}/{slug}/")
@@ -309,16 +322,91 @@ class AzubicaScraper(BaseScraper):
 
         return urls
 
-    def _parse_companies_from_atlas(self, html: str) -> List[dict]:
-        soup = BeautifulSoup(html, "html.parser")
+    def _clean_name(self, text: str) -> str:
+        """Clean and validate a company name."""
+        if not text:
+            return ""
+        text = text.strip()
+        # Remove common non-company suffixes
+        text = re.sub(r'\s*[-–:]\s*(mehr|weitere|weitere\s+ergebnisse|ergebnisse|angebote).*$', '', text, flags=re.IGNORECASE)
+        text = text.strip()
+        # Must be reasonable length and contain at least some letters
+        if len(text) < 3 or len(text) > 120:
+            return ""
+        if not re.search(r'[a-zA-ZäöüÄÖÜß]', text):
+            return ""
+        return text
+
+    def _extract_companies_from_text_blocks(self, soup) -> List[dict]:
+        """
+        Strategy: Find text blocks that look like company listings.
+        This is a fallback when structured selectors fail.
+        """
+        companies = []
+        seen = set()
+
+        # Look for divs/p tags with substantial text that mention training/company keywords
+        for el in soup.find_all(["div", "section", "article", "p"]):
+            text = el.get_text(" ", strip=True)
+            if len(text) < 20 or len(text) > 800:
+                continue
+
+            # Skip if it doesn't look like it contains company info
+            if not COMPANY_HINT_RE.search(text):
+                continue
+
+            # Extract potential company name (usually first substantial word group)
+            name_match = re.search(r'^([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß\.\-& ]{3,50})(?:\s*[-–:]\s*|\s+|\b)', text)
+            if not name_match:
+                continue
+
+            name = self._clean_name(name_match.group(1))
+            if not name or name.lower() in seen:
+                continue
+
+            # Extract website from links in this element
+            website = ""
+            for a in el.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and not any(d in href for d in EXCLUDED_DOMAINS):
+                    website = href
+                    break
+
+            # Extract email from this element
+            emails = extract_emails_from_html(str(el))
+            email = emails[0] if emails else ""
+
+            # Extract city
+            city = ""
+            m = POSTAL_CITY_RE.search(text)
+            if m:
+                city = m.group(1).strip()
+
+            seen.add(name.lower())
+            companies.append({
+                "name": name,
+                "website": website,
+                "email": email,
+                "city": city,
+                "title": self.profession,
+                "phone": self._extract_phone(text),
+            })
+
+        return companies
+
+    def _extract_companies_from_structured_data(self, soup) -> List[dict]:
+        """
+        Strategy: Try to find companies using structured HTML patterns.
+        """
         companies = []
 
-        # Try multiple selectors
+        # Expanded selectors for Azubica-style listings
         selectors = [
             ".company", ".company-item", ".employer", ".employer-item",
-            ".ausbildungsbetrieb", ".betrieb", ".firmen-entry",
+            ".ausbildungsbetrieb", ".betrieb", ".firmen-entry", ".firmen-card",
             "[class*='company']", "[class*='employer']", "[class*='firmen']",
-            "[class*='ausbildungs']", ".card", ".item", ".entry",
+            "[class*='ausbildungs']", "[class*='betrieb']", "[class*='stelle']",
+            ".card", ".item", ".entry", ".listing", ".result", ".job-card",
             "article", "section",
         ]
 
@@ -333,45 +421,53 @@ class AzubicaScraper(BaseScraper):
                 if companies:
                     break
 
-        # Fallback: extract from all links
-        if not companies:
-            self.log("info", "No structured data found, trying link extraction...")
-            companies = self._extract_companies_from_links(soup)
-
         return companies
 
     def _extract_company_from_element(self, el) -> Optional[dict]:
+        """Extract company info from a single HTML element."""
         name = ""
         website = ""
         email = ""
         city = ""
 
-        for tag in ["h2", "h3", "h4", "h5", ".name", ".title", ".company-name", "strong", "b"]:
+        # Try multiple name selectors
+        for tag in ["h1", "h2", "h3", "h4", "h5", ".name", ".title", ".company-name", "strong", "b", ".firma"]:
             name_el = el.select_one(tag) if hasattr(el, 'select_one') else None
             if name_el:
                 name = name_el.get_text(strip=True)
-                break
+                if name and len(name) > 2:
+                    break
 
-        if not name:
+        # Fallback: first line of text
+        if not name or len(name) <= 2:
             text = el.get_text(" ", strip=True) if hasattr(el, 'get_text') else ""
-            name = text.split("\n")[0][:100] if text else ""
+            if text:
+                # Take first sentence-ish chunk
+                first_line = text.split(".")[0].split("\n")[0][:100]
+                if first_line:
+                    name = first_line.strip()
 
-        for a in el.find_all("a", href=True) if hasattr(el, 'find_all') else []:
-            href = a["href"]
-            if href.startswith("http") and "azubica.de" not in href:
-                website = href
-                break
+        # Extract website from links
+        if hasattr(el, 'find_all'):
+            for a in el.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and not any(d in href for d in EXCLUDED_DOMAINS):
+                    website = href
+                    break
 
+        # Extract email
         text = el.get_text(" ", strip=True) if hasattr(el, 'get_text') else ""
         emails = extract_emails_from_html(str(el))
         if emails:
             email = emails[0]
 
+        # Extract city
         m = POSTAL_CITY_RE.search(text)
         if m:
             city = m.group(1).strip()
 
-        if name and len(name) > 2:
+        name = self._clean_name(name)
+        if name:
             return {
                 "name": name,
                 "website": website,
@@ -383,22 +479,43 @@ class AzubicaScraper(BaseScraper):
         return None
 
     def _extract_companies_from_links(self, soup) -> List[dict]:
+        """
+        Strategy: Extract companies from all external links on the page.
+        Improved to filter out navigation, footer, and non-company links.
+        """
         companies = []
         seen = set()
 
-        excluded = ("azubica.de", "facebook.com", "instagram.com", "linkedin.com",
-                    "tiktok.com", "youtube.com", "twitter.com", "x.com", "google.com",
-                    "bing.com", "yahoo.com", "wikipedia.org", "amazon.", "ebay.")
+        # Remove navigation, footer, header, and sidebar elements
+        for tag in soup(["nav", "footer", "header", "aside", "script", "style", "noscript"]):
+            tag.decompose()
 
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
             text = a.get_text(strip=True)
 
-            if not href.startswith("http") or any(d in href for d in excluded):
+            if not href.startswith("http"):
+                continue
+            if any(d in href for d in EXCLUDED_DOMAINS):
                 continue
 
-            domain = href.split("/")[2].replace("www.", "").split(".")[0]
-            name = text if text and len(text) > 2 else domain.replace("-", " ").title()
+            # Skip very short or very long link texts
+            if text and (len(text) < 3 or len(text) > 100):
+                continue
+
+            # Derive name from text or domain
+            if text and len(text) > 2:
+                name = text
+            else:
+                try:
+                    domain = href.split("/")[2].replace("www.", "").split(".")[0]
+                    name = domain.replace("-", " ").replace("_", " ").title()
+                except Exception:
+                    continue
+
+            name = self._clean_name(name)
+            if not name:
+                continue
 
             if name.lower() in seen:
                 continue
@@ -416,6 +533,7 @@ class AzubicaScraper(BaseScraper):
         return companies
 
     async def _lookup_email(self, client: httpx.AsyncClient, website: str) -> str:
+        """Lookup email on company website with timeout."""
         try:
             return await asyncio.wait_for(
                 find_email_on_company_website(
@@ -462,8 +580,23 @@ class AzubicaScraper(BaseScraper):
                     self.log("error", f"Failed to fetch {url}")
                     continue
 
-                companies = self._parse_companies_from_atlas(html)
-                self.log("info", f"Found {len(companies)} potential companies on page")
+                self.log("info", f"Fetched {len(html)} bytes from {url}")
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Strategy 1: Structured selectors
+                companies = self._extract_companies_from_structured_data(soup)
+                self.log("info", f"Strategy 1 (structured): found {len(companies)} companies")
+
+                # Strategy 2: Text block parsing
+                if not companies:
+                    companies = self._extract_companies_from_text_blocks(soup)
+                    self.log("info", f"Strategy 2 (text blocks): found {len(companies)} companies")
+
+                # Strategy 3: Link extraction
+                if not companies:
+                    companies = self._extract_companies_from_links(soup)
+                    self.log("info", f"Strategy 3 (links): found {len(companies)} companies")
+
                 all_companies.extend(companies)
 
             if not all_companies:
@@ -487,6 +620,7 @@ class AzubicaScraper(BaseScraper):
                 email = job["email"]
 
                 if not email and job["website"]:
+                    self.log("info", f"No email on page for '{job['name']}', checking website {job['website']}...")
                     email = await self._lookup_email(client, job["website"])
 
                 if not email:
