@@ -21,7 +21,7 @@ _ALLOWED_ORIGINS = [
         "CORS_ORIGINS",
         "http://localhost:5173,"
         "http://localhost:3000,"
-        "https://www.bewerbungs.online/login,"
+        "https://www.bewerbungs.online,"
         "https://bewerbung-boot-front-end.vercel.app",
     ).split(",")
     if o.strip()
