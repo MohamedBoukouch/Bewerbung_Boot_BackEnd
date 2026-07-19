@@ -101,42 +101,43 @@ async def find_email_on_company_website(
     if not website_url.startswith("http"):
         website_url = "https://" + website_url.lstrip("/")
 
-    # Step 1: homepage
-    try:
-        resp = await client.get(website_url, headers=headers, timeout=timeout, follow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
-        final_url = str(resp.url)
-    except Exception as e:
-        if log:
-            log("info", f"Could not reach company website '{website_url}': {e}")
-        return ""
-
-    emails = extract_emails_from_html(html)
-    if emails:
-        if log:
-            log("info", f"Email found on homepage of {final_url}: {emails[0]}")
-        return emails[0]
-
-    # Step 2: follow Impressum/Kontakt link
-    contact_url = _find_contact_link(html, final_url)
-    if not contact_url:
-        if log:
-            log("info", f"No Impressum/Kontakt link found on {final_url}")
-        return ""
-
-    try:
-        resp2 = await client.get(contact_url, headers=headers, timeout=timeout, follow_redirects=True)
-        resp2.raise_for_status()
-        emails2 = extract_emails_from_html(resp2.text)
-        if emails2:
+    async with httpx.AsyncClient(follow_redirects=True, verify=False) as insecure_client:
+        # Step 1: homepage
+        try:
+            resp = await insecure_client.get(website_url, headers=headers, timeout=timeout, follow_redirects=True)
+            resp.raise_for_status()
+            html = resp.text
+            final_url = str(resp.url)
+        except Exception as e:
             if log:
-                log("info", f"Email found on contact page {contact_url}: {emails2[0]}")
-            return emails2[0]
-        if log:
-            log("info", f"No email found on contact page {contact_url}")
-    except Exception as e:
-        if log:
-            log("info", f"Could not reach contact page '{contact_url}': {e}")
+                log("info", f"Could not reach company website '{website_url}': {e}")
+            return ""
+
+        emails = extract_emails_from_html(html)
+        if emails:
+            if log:
+                log("info", f"Email found on homepage of {final_url}: {emails[0]}")
+            return emails[0]
+
+        # Step 2: follow Impressum/Kontakt link
+        contact_url = _find_contact_link(html, final_url)
+        if not contact_url:
+            if log:
+                log("info", f"No Impressum/Kontakt link found on {final_url}")
+            return ""
+
+        try:
+            resp2 = await insecure_client.get(contact_url, headers=headers, timeout=timeout, follow_redirects=True)
+            resp2.raise_for_status()
+            emails2 = extract_emails_from_html(resp2.text)
+            if emails2:
+                if log:
+                    log("info", f"Email found on contact page {contact_url}: {emails2[0]}")
+                return emails2[0]
+            if log:
+                log("info", f"No email found on contact page {contact_url}")
+        except Exception as e:
+            if log:
+                log("info", f"Could not reach contact page '{contact_url}': {e}")
 
     return ""

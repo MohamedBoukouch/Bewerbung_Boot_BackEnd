@@ -54,9 +54,14 @@ class BaseScraper:
         """Best-effort: derive a favicon URL from the company website."""
         if not website:
             return ""
-        site = website.split("?")[0].rstrip("/")
-        if site.startswith("http"):
-            return f"{site}/favicon.ico"
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(website.split("?")[0].rstrip("/"))
+            domain = parsed.netloc or parsed.path
+            if domain:
+                return f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+        except Exception:
+            pass
         return ""
 
     def _extract_email(self, text: str) -> str:
