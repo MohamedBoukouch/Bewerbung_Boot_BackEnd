@@ -22,6 +22,18 @@ from app.services.auth import (
 
 router = APIRouter()
 
+# CORS preflight handlers for access routes
+@router.options("/leads/submit")
+@router.options("/validate-code")
+@router.options("/activate-code")
+@router.options("/session")
+@router.options("/google-status")
+@router.options("/logout")
+@router.options("/google-login")
+@router.options("/google/callback")
+async def cors_preflight():
+    return Response(status_code=204)
+
 # ═══════════════════════════════════════════════════════════
 # FILE STORES (persistent across workers & restarts)
 # ═══════════════════════════════════════════════════════════

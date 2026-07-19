@@ -4,7 +4,7 @@ MULTI-SOURCE MODE: always runs multiple platforms concurrently and merges result
 This eliminates "0 emails" problems caused by a single broken platform.
 """
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import asyncio
@@ -13,6 +13,14 @@ import inspect
 from app.services.extract_progress import reset, stream_generator, request_stop, get_stop_event
 
 router = APIRouter()
+
+# CORS preflight handlers
+@router.options("/extract")
+@router.options("/extract/stop")
+@router.options("/extract/stream")
+@router.options("/test-extract")
+async def cors_preflight():
+    return Response(status_code=204)
 
 # Lazy imports to avoid circular import issues at module level
 SCRAPER_MAP = {}

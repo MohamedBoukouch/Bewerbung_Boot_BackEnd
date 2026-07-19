@@ -35,6 +35,12 @@ from app.services.auth import (
 
 router = APIRouter(tags=["Email"])
 
+# CORS preflight handlers
+@router.options("/send-batch")
+@router.options("/status")
+async def cors_preflight():
+    return Response(status_code=204)
+
 # ── Configuration ──────────────────────────────────────────
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
