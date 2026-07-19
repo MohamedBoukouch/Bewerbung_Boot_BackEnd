@@ -123,8 +123,14 @@ class BaseScraper:
         self._progress()
 
     def _should_stop(self) -> bool:
-        """Check if we've reached the exact target limit."""
-        return len(self.companies) >= self.target_max
+        """Check if we've reached the exact target limit or a stop was requested."""
+        if len(self.companies) >= self.target_max:
+            return True
+        try:
+            from app.services.extract_progress import get_stop_event
+            return get_stop_event().is_set()
+        except Exception:
+            return False
 
     def _add_company(self, name: str, email: str, city: str, website: str, phone: str, job_title: str):
         """Add company to results. ONLY if email is present.

@@ -15,12 +15,27 @@ import time
 # replaces the object, so concurrent connections stay consistent.
 _STATE = {"queue": None, "lock": None}
 
+# Global stop event for cancelling active scrapes
+_STOP_EVENT = None
+
 
 def _get_queue():
     if _STATE["queue"] is None:
         _STATE["queue"] = asyncio.Queue()
         _STATE["lock"] = asyncio.Lock()
     return _STATE["queue"]
+
+
+def get_stop_event() -> asyncio.Event:
+    global _STOP_EVENT
+    if _STOP_EVENT is None:
+        _STOP_EVENT = asyncio.Event()
+    return _STOP_EVENT
+
+
+def request_stop():
+    ev = get_stop_event()
+    ev.set()
 
 
 def reset():
@@ -31,6 +46,10 @@ def reset():
             q.get_nowait()
         except Exception:
             break
+    # Reset stop event for new scrape
+    global _STOP_EVENT
+    if _STOP_EVENT is not None:
+        _STOP_EVENT.clear()
 
 
 async def emit(event: dict):

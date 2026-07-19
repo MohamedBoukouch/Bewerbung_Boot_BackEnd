@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 import asyncio
 import inspect
 
-from app.services.extract_progress import reset, stream_generator
+from app.services.extract_progress import reset, stream_generator, request_stop, get_stop_event
 
 router = APIRouter()
 
@@ -86,6 +86,57 @@ DEFAULT_SOURCES = [
     "aubiplus",
     "azubica",
     "indeed",
+    "linkedin",
+    "xing",
+    "stepstone",
+    "jobware",
+    "monster",
+    "kimeta",
+    "jobboerse_de",
+    "stellenanzeigen_de",
+    "meinestadt",
+    "jooble",
+    "glassdoor",
+    "jobmensa",
+    "workwise",
+    "absolventa",
+    "berufsstart",
+    "meinpraktikum",
+    "praktikum_info",
+    "praktika_de",
+    "workingstudentjobs_de",
+    "staufenbiel",
+    "eures",
+    "make_it_in_germany",
+    "interamt",
+    "bund_de",
+    "lehrstellenradar",
+    "handwerk_de",
+    "ihk",
+    "talent",
+    "joblift",
+    "yourfirm",
+    "yourfirm_ausbildung",
+    "connectoor",
+    "jobtensor",
+    "germantechjobs",
+    "berlin_startup_jobs",
+    "arbeitnow",
+    "wellfound",
+    "relocate_me",
+    "jobvector",
+    "academics",
+    "medi_jobs",
+    "hotelcareer",
+    "gastrojobs",
+    "logistik_jobs",
+    "salesjob",
+    "greenjobs",
+    "unicum",
+    "campusjaeger",
+    "jobstairs",
+    "heyjobs",
+    "hokify",
 ]
 
 
@@ -357,6 +408,13 @@ async def extract_stream():
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/extract/stop")
+async def extract_stop():
+    """Request the currently running scrape to stop and return partial results."""
+    request_stop()
+    return {"status": "stopped", "message": "Stop signal sent. Scrapers will finish current item and return partial results."}
 
 
 @router.get("/test-extract")
