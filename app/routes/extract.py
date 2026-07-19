@@ -1,6 +1,7 @@
 """
 Extraction route: handles scraping requests from the frontend.
-Supports: arbeitsagentur, azubiyo, aubiplus, ausbildungde, azubica, indeed, linkedin, xing
+MULTI-SOURCE MODE: always runs multiple platforms concurrently and merges results.
+This eliminates "0 emails" problems caused by a single broken platform.
 """
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -76,6 +77,18 @@ def _load_scrapers():
     SCRAPER_MAP = scrapers
 
 
+# Sources that are always queried in the background regardless of user choice.
+# These are the most reliable platforms for German apprenticeship/company emails.
+DEFAULT_SOURCES = [
+    "arbeitsagentur",
+    "ausbildungde",
+    "azubiyo",
+    "aubiplus",
+    "azubica",
+    "indeed",
+]
+
+
 class ExtractConfig(BaseModel):
     """Flexible config that works for ALL sources."""
     profession: str = ""
@@ -142,9 +155,43 @@ def _build_scraper_kwargs(source: str, config: ExtractConfig, fieldTags: List[st
     return kwargs
 
 
+async def _run_single_source(source: str, payload: ExtractPayload, add_log) -> List[dict]:
+    """Run a single scraper source with timeout and error handling."""
+    try:
+        ScraperClass = SCRAPER_MAP[source]
+        kwargs = _build_scraper_kwargs(
+            source=source,
+            config=payload.config,
+            fieldTags=payload.fieldTags,
+            maxResults=payload.maxResults,
+            add_log=add_log,
+        )
+
+        sig = inspect.signature(ScraperClass.__init__)
+        valid_params = set(sig.parameters.keys())
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+
+        scraper = ScraperClass(**filtered_kwargs)
+        scraper.source_label = source
+        scraper.target_max = payload.maxResults
+
+        add_log("info", f"[{source}] Starting scrape...")
+
+        companies = await asyncio.wait_for(scraper.scrape(), timeout=180.0)
+        add_log("success", f"[{source}] Found {len(companies)} companies with email")
+        return companies
+
+    except asyncio.TimeoutError:
+        add_log("error", f"[{source}] Timed out after 180s")
+        return []
+    except Exception as e:
+        add_log("error", f"[{source}] Failed: {str(e)}")
+        return []
+
+
 @router.post("/extract", response_model=ExtractResponse)
 async def extract_data(payload: ExtractPayload):
-    """Main extraction endpoint."""
+    """Main extraction endpoint. Runs MULTIPLE sources concurrently and merges results."""
     _load_scrapers()
 
     logs = []
@@ -159,13 +206,12 @@ async def extract_data(payload: ExtractPayload):
     except Exception:
         pass
 
-    add_log("info", f"=== NEW EXTRACTION REQUEST ===")
-    add_log("info", f"Source: {payload.source}")
+    add_log("info", "=== MULTI-SOURCE EXTRACTION REQUEST ===")
+    add_log("info", f"Selected source: {payload.source}")
     add_log("info", f"Profession: '{payload.config.profession}'")
     add_log("info", f"Location: '{payload.config.location}'")
     add_log("info", f"Max Results: {payload.maxResults}")
-    add_log("info", "Filter: Only companies with email will be kept")
-    add_log("info", "Will keep scraping until exact target is reached or no more results.")
+    add_log("info", "Strategy: Multiple platforms concurrently -> merge & deduplicate")
 
     if payload.source not in SCRAPER_MAP:
         supported = ", ".join(SCRAPER_MAP.keys())
@@ -189,59 +235,83 @@ async def extract_data(payload: ExtractPayload):
             error="Profession is required but was empty."
         )
 
+    # Build the list of sources to run:
+    # Always include reliable defaults + the user-selected source (if different).
+    sources_to_run = list(DEFAULT_SOURCES)
+    if payload.source not in sources_to_run:
+        sources_to_run.insert(0, payload.source)
+
+    # Keep only sources that are actually available
+    sources_to_run = [s for s in sources_to_run if s in SCRAPER_MAP]
+
+    add_log("info", f"Will query {len(sources_to_run)} platforms: {', '.join(sources_to_run)}")
+
     try:
-        ScraperClass = SCRAPER_MAP[payload.source]
-
-        kwargs = _build_scraper_kwargs(
-            source=payload.source,
-            config=payload.config,
-            fieldTags=payload.fieldTags,
-            maxResults=payload.maxResults,
-            add_log=add_log,
-        )
-
-        # Filter kwargs to only include what the scraper accepts
-        sig = inspect.signature(ScraperClass.__init__)
-        valid_params = set(sig.parameters.keys())
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-
-        add_log("info", f"Scraper kwargs: {filtered_kwargs}")
-
-        scraper = ScraperClass(**filtered_kwargs)
-        scraper.source_label = payload.source
-        scraper.target_max = payload.maxResults  # EXACT limit target
-
+        # Notify SSE that scraping is starting
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(True, payload.source, "", "", 0, 0, "running")
         except Exception:
             pass
 
-        companies = await asyncio.wait_for(scraper.scrape(), timeout=600.0)  # 10 min timeout
+        # Run all sources concurrently
+        tasks = [
+            _run_single_source(source, payload, add_log)
+            for source in sources_to_run
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # STRICT LIMIT: Slice to exact maxResults requested
-        if len(companies) > payload.maxResults:
-            add_log("info", f"Found {len(companies)} companies, limiting to exact {payload.maxResults} requested.")
-            companies = companies[:payload.maxResults]
+        # Merge results from all sources
+        all_companies: List[dict] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                add_log("error", f"[{sources_to_run[i]}] Unhandled error: {result}")
+            elif isinstance(result, list):
+                all_companies.extend(result)
+            else:
+                add_log("error", f"[{sources_to_run[i]}] Unexpected result type: {type(result)}")
 
-        add_log("success", f"Extraction complete! {len(companies)} companies with email found.")
+        add_log("info", f"Raw total from all sources: {len(all_companies)}")
 
-        # Tell the SSE stream the scrape is done.
+        # Cross-source deduplication by (normalized company name, normalized email)
+        seen = set()
+        unique_companies: List[dict] = []
+        for c in all_companies:
+            name = (c.get("company_name") or c.get("name") or "").strip().lower()
+            email = (c.get("email") or "").strip().lower()
+            if not name or not email:
+                continue
+            key = f"{name}|{email}"
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_companies.append(c)
+
+        add_log("info", f"After cross-source deduplication: {len(unique_companies)}")
+
+        # Strict limit to requested maxResults
+        if len(unique_companies) > payload.maxResults:
+            add_log("info", f"Limiting to exact {payload.maxResults} requested.")
+            unique_companies = unique_companies[:payload.maxResults]
+
+        add_log("success", f"Multi-source extraction complete! {len(unique_companies)} companies with email found.")
+
+        # Tell SSE stream the scrape is done.
         try:
             from app.services.extract_progress import set_progress as _sp
-            _sp(True, payload.source, "", "", len(companies), 0, "done")
+            _sp(True, payload.source, "", "", len(unique_companies), 0, "done")
         except Exception:
             pass
 
         return ExtractResponse(
             success=True,
-            companies=companies,
-            totalItems=len(companies),
+            companies=unique_companies,
+            totalItems=len(unique_companies),
             logs=logs,
         )
 
     except asyncio.TimeoutError:
-        add_log("error", "Scrape timed out after 10 minutes.")
+        add_log("error", "Global scrape timed out after 10 minutes.")
         try:
             from app.services.extract_progress import set_progress as _sp
             _sp(False, payload.source, "", "", 0, 0, "error")
@@ -261,10 +331,9 @@ async def extract_data(payload: ExtractPayload):
         traceback_str = traceback.format_exc()
         add_log("error", error_msg)
         add_log("error", f"Traceback: {traceback_str}")
-        # Tell the SSE stream the scrape errored.
         try:
             from app.services.extract_progress import set_progress as _sp
-            _sp(False, payload.source, "", "", len(getattr(e, "companies", [])), 0, "error")
+            _sp(False, payload.source, "", "", 0, 0, "error")
         except Exception:
             pass
         return ExtractResponse(
@@ -278,12 +347,7 @@ async def extract_data(payload: ExtractPayload):
 
 @router.get("/extract/stream")
 async def extract_stream():
-    """Server-Sent Events stream of live scraping progress.
-
-    Emits `progress` events (current company, its logo URL,
-    running email count) and `log` events, terminated by a
-    `done` / `error` / `stopped` progress event.
-    """
+    """Server-Sent Events stream of live scraping progress."""
     return StreamingResponse(
         stream_generator(),
         media_type="text/event-stream",
@@ -297,66 +361,45 @@ async def extract_stream():
 
 @router.get("/test-extract")
 async def test_extract():
-    """Quick test endpoint with fixed params."""
+    """Quick test endpoint with fixed params (uses multi-source mode)."""
     import asyncio
     import traceback
 
     logs = []
+
     def add_log(type_: str, message: str):
         logs.append({"type": type_, "message": message})
         print(f"[{type_.upper()}] {message}")
 
-    add_log("info", "=== TEST EXTRACTION ===")
+    add_log("info", "=== TEST EXTRACTION (MULTI-SOURCE) ===")
     add_log("info", "Profession: Softwareentwickler")
     add_log("info", "Location: Berlin")
     add_log("info", "Max Results: 10")
-    add_log("info", "Filter: Only companies with email")
 
     try:
         _load_scrapers()
-        if "arbeitsagentur" not in SCRAPER_MAP:
-            return {
-                "success": False,
-                "error": "Arbeitsagentur scraper not available",
-                "logs": logs,
-            }
 
-        scraper = SCRAPER_MAP["arbeitsagentur"](
-            profession="Softwareentwickler",
-            location="Berlin",
-            location_scope="Ganzer Ort",
-            job_type="Arbeit",
-            date_filter="Alle anzeigen",
-            max_results=10,
-            field_tags=["Softwareentwickler"],
-            log_callback=add_log,
-        )
-        scraper.target_max = 10
+        class FakePayload:
+            source = "arbeitsagentur"
+            config = ExtractConfig(
+                profession="Softwareentwickler",
+                location="Berlin",
+                locationScope="Ganzer Ort",
+                jobType="Ausbildung / Duales Studium",
+                date="Heute",
+                maxJobs=10,
+            )
+            fieldTags = ["Softwareentwickler"]
+            maxResults = 10
 
-        add_log("info", "Starting scrape with 60s timeout...")
-        companies = await asyncio.wait_for(scraper.scrape(), timeout=60.0)
-
-        # STRICT LIMIT
-        if len(companies) > 10:
-            companies = companies[:10]
-
-        add_log("success", f"Scrape complete! {len(companies)} companies with email found.")
-
+        payload = FakePayload()
+        response = await extract_data(payload)
         return {
-            "success": True,
-            "companies": companies,
-            "totalItems": len(companies),
-            "logs": logs,
-        }
-
-    except asyncio.TimeoutError:
-        add_log("error", "Scrape timed out after 60 seconds!")
-        return {
-            "success": False,
-            "companies": [],
-            "totalItems": 0,
-            "logs": logs,
-            "error": "Scrape timed out after 60 seconds",
+            "success": response.success,
+            "companies": response.companies,
+            "totalItems": response.totalItems,
+            "logs": response.logs,
+            "error": response.error,
         }
 
     except Exception as e:
