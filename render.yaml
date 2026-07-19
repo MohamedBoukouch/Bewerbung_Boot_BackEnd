@@ -22,10 +22,10 @@ services:
       - key: GOOGLE_REDIRECT_URI
         value: https://bewerbung-boot-backend.onrender.com/api/access/google/callback
       - key: FRONTEND_CALLBACK_URL
-        value: https://bewerbung-boot-front-end.vercel.app/auth/callback
+        value: https://www.bewerbungs.online/auth/callback
       - key: SESSION_SECRET_KEY
         sync: false
       - key: CORS_ORIGINS
-        value: http://localhost:5173,https://bewerbung-boot-front-end.vercel.app,https://bewerbung-boot-backend.onrender.com
+        value: http://localhost:5173,https://www.bewerbungs.online,https://bewerbung-boot-backend.onrender.com
       - key: PORT
         sync: false
